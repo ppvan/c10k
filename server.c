@@ -1,6 +1,5 @@
 #include <arpa/inet.h>
 #include <assert.h>
-#include <bits/pthreadtypes.h>
 #include <err.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -41,17 +40,41 @@ void *echo(void *arg) {
     peer_fd = (int)(intptr_t)arg;
     echo_buf = malloc(buf_size);
 
+    if (echo_buf == NULL) {
+        close(peer_fd);
+        return NULL;
+    }
+
     do {
         bytes_read = recv(peer_fd, echo_buf, buf_size, 0);
-        if (bytes_read <= 0) {
+
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by a signal, try again safely
+            }
+
+            goto out;
+        }
+
+        if (bytes_read == 0) {
+            printf("client fd=%d EOF\n", peer_fd);
             goto out;
         }
 
         bytes_write = 0;
         do {
-            ssize_t written = send(peer_fd, echo_buf + bytes_write,
-                                   (size_t)(bytes_read - bytes_write), 0);
+            ssize_t written =
+                send(peer_fd, echo_buf + bytes_write,
+                     (size_t)(bytes_read - bytes_write), MSG_NOSIGNAL);
             if (written < 0) {
+                if (errno == EINTR) {
+                    continue; // Interrupted by a signal, try again safely
+                }
+
+                goto out;
+            }
+
+            if (written == 0) {
                 goto out;
             }
             bytes_write += written;
@@ -88,8 +111,17 @@ int main(int argc, char **argv) {
 
     address = shift_args(&argc, &argv);
     port_str = shift_args(&argc, &argv);
-    port = (uint16_t)atoi(port_str);
+    char *end;
+    errno = 0;
 
+    long value = strtol(port_str, &end, 10);
+
+    if (errno != 0 || end == port_str || *end != '\0' || value < 1 ||
+        value > 65535) {
+        errx(EXIT_FAILURE, "invalid port: %s", port_str);
+    }
+
+    port = (uint16_t)value;
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         err(EXIT_FAILURE, "Open socket failed");
@@ -108,11 +140,13 @@ int main(int argc, char **argv) {
 
     ret = bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
     if (ret < 0) {
+        close(fd);
         err(EXIT_FAILURE, "Bind failed");
     }
 
     ret = listen(fd, backlog);
     if (ret < 0) {
+        close(fd);
         err(EXIT_FAILURE, "Listen failed");
     }
     printf("Listenning to: %s:%d.\n", address, port);
@@ -123,6 +157,7 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0; // no SA_RESTART, so accept() gets interrupted
     if (sigaction(SIGINT, &sa, NULL) < 0) {
+        close(fd);
         err(EXIT_FAILURE, "sigaction failed");
     }
 
@@ -151,10 +186,12 @@ int main(int argc, char **argv) {
 
         if (rc != 0) {
             fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+            close(peer_fd);
             exit(EXIT_FAILURE);
         }
         pthread_detach(t);
     }
 
+    close(fd);
     return 0;
 }
