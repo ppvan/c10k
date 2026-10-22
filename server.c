@@ -1,7 +1,11 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <bits/pthreadtypes.h>
 #include <err.h>
+#include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,14 +13,57 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #define BUF_SIZE 1024
+
+static volatile sig_atomic_t running = 1;
+
+static void handle_sigint(int sig) {
+    (void)sig;
+    running = 0;
+}
 
 char *shift_args(int *argc, char ***argv) {
     assert((*argc) > 0);
     (*argc)--;
 
     return *(*argv)++;
+}
+
+void *echo(void *arg) {
+    int peer_fd = -1;
+    ssize_t bytes_read = 0;
+    ssize_t bytes_write = 0;
+    size_t buf_size = 1024;
+    char *echo_buf;
+
+    peer_fd = (int)(intptr_t)arg;
+    echo_buf = malloc(buf_size);
+
+    do {
+        bytes_read = recv(peer_fd, echo_buf, buf_size, 0);
+        if (bytes_read <= 0) {
+            goto out;
+        }
+
+        bytes_write = 0;
+        do {
+            ssize_t written = send(peer_fd, echo_buf + bytes_write,
+                                   (size_t)(bytes_read - bytes_write), 0);
+            if (written < 0) {
+                goto out;
+            }
+            bytes_write += written;
+        } while (bytes_write < bytes_read);
+
+    } while (bytes_read != 0);
+
+out:
+    free(echo_buf);
+    close(peer_fd);
+
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -26,14 +73,11 @@ int main(int argc, char **argv) {
     uint16_t port = 0;
     int fd = -1;
     struct sockaddr_in serv_addr;
-    const int backlog = 1;
+    const int backlog = SOMAXCONN;
     int ret;
-    int peer_fd;
     struct sockaddr peer_addr;
     socklen_t peer_addr_len;
-    char buf[BUF_SIZE];
-    ssize_t bytes_read = 0;
-    ssize_t bytes_write = 0;
+
     int opt = 1;
 
     program_name = shift_args(&argc, &argv);
@@ -73,22 +117,43 @@ int main(int argc, char **argv) {
     }
     printf("Listenning to: %s:%d.\n", address, port);
 
-    peer_addr_len = sizeof(peer_addr);
-    memset(&peer_addr, 0, sizeof(struct sockaddr));
-
-    peer_fd = accept(fd, &peer_addr, &peer_addr_len);
-    if (peer_fd < 0) {
-        err(EXIT_FAILURE, "Accept failed");
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // no SA_RESTART, so accept() gets interrupted
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        err(EXIT_FAILURE, "sigaction failed");
     }
 
-    bytes_read = recv(peer_fd, &buf, BUF_SIZE, 0);
-    if (bytes_read < 0) {
-        err(EXIT_FAILURE, "recv() failed");
-    }
+    int peer_fd;
+    while (running) {
+        pthread_t t;
+        peer_addr_len = sizeof(peer_addr);
+        memset(&peer_addr, 0, sizeof(struct sockaddr));
+        memset(&t, 0, sizeof(pthread_t));
 
-    bytes_write = send(peer_fd, &buf, (size_t)bytes_read, 0);
-    if (bytes_write < 0) {
-        err(EXIT_FAILURE, "send() failed");
+        peer_fd = accept(fd, &peer_addr, &peer_addr_len);
+        if (peer_fd < 0) {
+            if (errno == EINTR && !running) {
+                break;
+            }
+            err(EXIT_FAILURE, "Accept failed");
+        }
+
+        sigset_t set, old;
+        sigemptyset(&set);
+        sigaddset(&set, SIGINT);
+        pthread_sigmask(SIG_BLOCK, &set, &old);
+
+        int rc = pthread_create(&t, NULL, echo, (void *)(intptr_t)peer_fd);
+        pthread_sigmask(SIG_SETMASK, &old, NULL);
+
+        if (rc != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+            exit(EXIT_FAILURE);
+        }
+        pthread_detach(t);
     }
 
     return 0;
