@@ -170,10 +170,11 @@ int main(int argc, char **argv) {
 
         peer_fd = accept(fd, &peer_addr, &peer_addr_len);
         if (peer_fd < 0) {
-            if (errno == EINTR && !running) {
-                break;
+            if (errno == ECONNABORTED || errno == EINTR || errno == EAGAIN) {
+                continue;
+            } else {
+                err(EXIT_FAILURE, "Accept failed");
             }
-            err(EXIT_FAILURE, "Accept failed");
         }
 
         sigset_t set, old;
@@ -187,7 +188,7 @@ int main(int argc, char **argv) {
         if (rc != 0) {
             fprintf(stderr, "pthread_create: %s\n", strerror(rc));
             close(peer_fd);
-            exit(EXIT_FAILURE);
+            continue;
         }
         pthread_detach(t);
     }
