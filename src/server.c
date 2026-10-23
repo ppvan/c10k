@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <asm-generic/errno-base.h>
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
@@ -17,112 +18,79 @@
 #define BUF_SIZE 1024
 
 static volatile sig_atomic_t running = 1;
-
 static void handle_sigint(int sig) {
     (void)sig;
     running = 0;
 }
 
-char *shift_args(int *argc, char ***argv) {
+static char *shift_args(int *argc, char ***argv) {
     assert((*argc) > 0);
     (*argc)--;
 
     return *(*argv)++;
 }
 
-void *echo(void *arg) {
-    int peer_fd = -1;
-    ssize_t bytes_read = 0;
-    ssize_t bytes_write = 0;
-    size_t buf_size = 1024;
-    char *echo_buf;
+static int send_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
 
-    peer_fd = (int)(intptr_t)arg;
-    echo_buf = malloc(buf_size);
-
-    if (echo_buf == NULL) {
-        close(peer_fd);
-        return NULL;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
     }
 
-    do {
-        bytes_read = recv(peer_fd, echo_buf, buf_size, 0);
+    return 0;
+}
 
-        if (bytes_read < 0) {
-            if (errno == EINTR) {
-                continue; // Interrupted by a signal, try again safely
-            }
+static void *handle_client(void *arg) {
+    char echo_buf[BUF_SIZE];
+    int peer_fd = (int)(intptr_t)arg;
 
-            goto out;
+    for (;;) {
+        ssize_t bytes_read = recv(peer_fd, echo_buf, sizeof(echo_buf), 0);
+        if (bytes_read < 0 && errno == EINTR) {
+            continue;
         }
 
-        if (bytes_read == 0) {
-            printf("client fd=%d EOF\n", peer_fd);
-            goto out;
+        if (bytes_read <= 0) {
+            break;
+        } else if (bytes_read > 0) {
+            send_all(peer_fd, echo_buf, (size_t)bytes_read);
         }
-
-        bytes_write = 0;
-        do {
-            ssize_t written =
-                send(peer_fd, echo_buf + bytes_write,
-                     (size_t)(bytes_read - bytes_write), MSG_NOSIGNAL);
-            if (written < 0) {
-                if (errno == EINTR) {
-                    continue; // Interrupted by a signal, try again safely
-                }
-
-                goto out;
-            }
-
-            if (written == 0) {
-                goto out;
-            }
-            bytes_write += written;
-        } while (bytes_write < bytes_read);
-
-    } while (bytes_read != 0);
-
-out:
-    free(echo_buf);
+    }
     close(peer_fd);
 
     return NULL;
 }
 
-int main(int argc, char **argv) {
-    const char *program_name;
-    char *address;
-    char *port_str;
-    uint16_t port = 0;
-    int fd = -1;
-    struct sockaddr_in serv_addr;
-    const int backlog = SOMAXCONN;
-    int ret;
-    struct sockaddr peer_addr;
-    socklen_t peer_addr_len;
+static void usage_and_exit(const char *prog) {
+    fprintf(stderr, "usage: %s <address> <port>\n", prog);
+    exit(EXIT_FAILURE);
+}
 
+static uint16_t parse_port(const char *raw_port) {
+    char *end = NULL;
+    long value = strtol(raw_port, &end, 10);
+    if (errno != 0 || end == raw_port || *end != '\0' || value < 1 ||
+        value > 65535) {
+        errx(EXIT_FAILURE, "invalid port: %s", raw_port);
+    }
+
+    return (uint16_t)value;
+}
+
+static int create_listener(const char *address, uint16_t port) {
     int opt = 1;
 
-    program_name = shift_args(&argc, &argv);
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <address> <port>\n", program_name);
-        exit(EXIT_FAILURE);
-    }
+    struct sockaddr_in serv_addr;
+    const int backlog = SOMAXCONN;
+    
 
-    address = shift_args(&argc, &argv);
-    port_str = shift_args(&argc, &argv);
-    char *end;
-    errno = 0;
-
-    long value = strtol(port_str, &end, 10);
-
-    if (errno != 0 || end == port_str || *end != '\0' || value < 1 ||
-        value > 65535) {
-        errx(EXIT_FAILURE, "invalid port: %s", port_str);
-    }
-
-    port = (uint16_t)value;
-    fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         err(EXIT_FAILURE, "Open socket failed");
     }
@@ -138,7 +106,7 @@ int main(int argc, char **argv) {
     }
     serv_addr.sin_port = htons(port);
 
-    ret = bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    int ret = bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
     if (ret < 0) {
         close(fd);
         err(EXIT_FAILURE, "Bind failed");
@@ -149,17 +117,24 @@ int main(int argc, char **argv) {
         close(fd);
         err(EXIT_FAILURE, "Listen failed");
     }
-    printf("Listenning to: %s:%d.\n", address, port);
 
+    return fd;
+}
+
+static void install_sigint_handler(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sigint;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0; // no SA_RESTART, so accept() gets interrupted
     if (sigaction(SIGINT, &sa, NULL) < 0) {
-        close(fd);
         err(EXIT_FAILURE, "sigaction failed");
     }
+}
+
+static void accept_loop(int listen_fd) {
+    struct sockaddr peer_addr;
+    socklen_t peer_addr_len;
 
     int peer_fd;
     while (running) {
@@ -168,7 +143,7 @@ int main(int argc, char **argv) {
         memset(&peer_addr, 0, sizeof(struct sockaddr));
         memset(&t, 0, sizeof(pthread_t));
 
-        peer_fd = accept(fd, &peer_addr, &peer_addr_len);
+        peer_fd = accept(listen_fd, &peer_addr, &peer_addr_len);
         if (peer_fd < 0) {
             if (errno == ECONNABORTED || errno == EINTR || errno == EAGAIN) {
                 continue;
@@ -182,7 +157,8 @@ int main(int argc, char **argv) {
         sigaddset(&set, SIGINT);
         pthread_sigmask(SIG_BLOCK, &set, &old);
 
-        int rc = pthread_create(&t, NULL, echo, (void *)(intptr_t)peer_fd);
+        int rc =
+            pthread_create(&t, NULL, handle_client, (void *)(intptr_t)peer_fd);
         pthread_sigmask(SIG_SETMASK, &old, NULL);
 
         if (rc != 0) {
@@ -192,7 +168,23 @@ int main(int argc, char **argv) {
         }
         pthread_detach(t);
     }
+}
 
-    close(fd);
+int main(int argc, char **argv) {
+
+    const char *program_name = shift_args(&argc, &argv);
+    if (argc < 2) {
+        usage_and_exit(program_name);
+    }
+    const char *address = shift_args(&argc, &argv);
+    uint16_t port = parse_port(shift_args(&argc, &argv));
+
+    int listen_fd = create_listener(address, port);
+    install_sigint_handler();
+
+    printf("Listenning to: %s:%u.\n", address, port);
+    accept_loop(listen_fd);
+
+    close(listen_fd);
     return 0;
 }

@@ -5,13 +5,12 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug server",
-      "program": "${workspaceFolder}/server",
+      "program": "${workspaceFolder}/bin/server.out",
       "args": ["127.0.0.1", "8080"],
       "cwd": "${workspaceFolder}",
       "env": {
         "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1"
-      },
-      "preLaunchTask": "build debug"
+      }
     }
   ]
 }
