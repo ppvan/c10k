@@ -1,11 +1,12 @@
 #include <arpa/inet.h>
-#include <asm-generic/errno-base.h>
 #include <assert.h>
+#include <bits/pthreadtypes.h>
 #include <err.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,10 +18,54 @@
 
 #define BUF_SIZE 1024
 
-static volatile sig_atomic_t running = 1;
+static _Atomic int32_t running = 1;
 static void handle_sigint(int sig) {
     (void)sig;
-    running = 0;
+    atomic_store_explicit(&running, 0, memory_order_relaxed);
+}
+
+static _Atomic uint64_t total_accepted;
+static _Atomic uint64_t total_closed;
+static atomic_long active;
+static atomic_long peak;
+
+static void stats_on_accept(void) {
+    atomic_fetch_add_explicit(&total_accepted, 1, memory_order_relaxed);
+    long now = atomic_fetch_add_explicit(&active, 1, memory_order_relaxed) + 1;
+
+    long old = atomic_load_explicit(&peak, memory_order_relaxed);
+
+    for (;;) {
+        if (now <= old)
+            break;
+
+        if (atomic_compare_exchange_weak_explicit(
+                &peak, &old, now, memory_order_relaxed, memory_order_relaxed))
+            break;
+
+        // On failure, old has been refreshed.
+    }
+}
+
+static void stats_on_close(void) {
+    atomic_fetch_add_explicit(&total_closed, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&active, 1, memory_order_relaxed);
+}
+
+static void *stats_thread(void *arg) {
+    (void)arg;
+    while (atomic_load_explicit(&running, memory_order_relaxed)) {
+        sleep(1);
+        printf("active=%ld peak=%ld accepted=%llu closed=%llu\n",
+               atomic_load_explicit(&active, memory_order_relaxed),
+               atomic_load_explicit(&peak, memory_order_relaxed),
+               (unsigned long long)atomic_load_explicit(&total_accepted,
+                                                        memory_order_relaxed),
+               (unsigned long long)atomic_load_explicit(&total_closed,
+                                                        memory_order_relaxed));
+    }
+
+    return NULL;
 }
 
 static char *shift_args(int *argc, char ***argv) {
@@ -58,11 +103,15 @@ static void *handle_client(void *arg) {
 
         if (bytes_read <= 0) {
             break;
-        } else if (bytes_read > 0) {
-            send_all(peer_fd, echo_buf, (size_t)bytes_read);
+        }
+
+        if (send_all(peer_fd, echo_buf, (size_t)bytes_read) < 0) {
+            break;
         }
     }
+
     close(peer_fd);
+    stats_on_close();
 
     return NULL;
 }
@@ -74,6 +123,8 @@ static void usage_and_exit(const char *prog) {
 
 static uint16_t parse_port(const char *raw_port) {
     char *end = NULL;
+
+    errno = 0;
     long value = strtol(raw_port, &end, 10);
     if (errno != 0 || end == raw_port || *end != '\0' || value < 1 ||
         value > 65535) {
@@ -85,36 +136,42 @@ static uint16_t parse_port(const char *raw_port) {
 
 static int create_listener(const char *address, uint16_t port) {
     int opt = 1;
-
-    struct sockaddr_in serv_addr;
     const int backlog = SOMAXCONN;
-    
+    struct sockaddr_storage serv_addr;
+    socklen_t addrlen;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&serv_addr, 0, sizeof(serv_addr));
+
+    struct sockaddr_in *sin = (struct sockaddr_in *)&serv_addr;
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&serv_addr;
+
+    if (inet_pton(AF_INET, address, &sin->sin_addr) == 1) {
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(port);
+        addrlen = sizeof(*sin);
+    } else if (inet_pton(AF_INET6, address, &sin6->sin6_addr) == 1) {
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_port = htons(port);
+        addrlen = sizeof(*sin6);
+    } else {
+        errx(EXIT_FAILURE, "invalid address");
+    }
+
+    int fd = socket(serv_addr.ss_family, SOCK_STREAM, 0);
     if (fd < 0) {
         err(EXIT_FAILURE, "Open socket failed");
     }
-
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         err(EXIT_FAILURE, "setsockopt failed");
     }
 
-    memset(&serv_addr, 0, sizeof(struct sockaddr_in));
-    serv_addr.sin_family = AF_INET;
-    if (inet_pton(AF_INET, address, &serv_addr.sin_addr) != 1) {
-        errx(EXIT_FAILURE, "invalid address");
-    }
-    serv_addr.sin_port = htons(port);
-
-    int ret = bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    int ret = bind(fd, (void *)&serv_addr, addrlen);
     if (ret < 0) {
-        close(fd);
         err(EXIT_FAILURE, "Bind failed");
     }
 
     ret = listen(fd, backlog);
     if (ret < 0) {
-        close(fd);
         err(EXIT_FAILURE, "Listen failed");
     }
 
@@ -133,24 +190,27 @@ static void install_sigint_handler(void) {
 }
 
 static void accept_loop(int listen_fd) {
-    struct sockaddr peer_addr;
-    socklen_t peer_addr_len;
-
     int peer_fd;
-    while (running) {
+    while (atomic_load_explicit(&running, memory_order_relaxed)) {
         pthread_t t;
-        peer_addr_len = sizeof(peer_addr);
-        memset(&peer_addr, 0, sizeof(struct sockaddr));
-        memset(&t, 0, sizeof(pthread_t));
-
-        peer_fd = accept(listen_fd, &peer_addr, &peer_addr_len);
+        peer_fd = accept(listen_fd, NULL, NULL);
         if (peer_fd < 0) {
             if (errno == ECONNABORTED || errno == EINTR || errno == EAGAIN) {
                 continue;
-            } else {
+            }
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+                errno == ENOMEM) {
+                warn("accept");
+                sleep(1);
+                continue;
+            }
+
+            else {
                 err(EXIT_FAILURE, "Accept failed");
             }
         }
+
+        stats_on_accept();
 
         sigset_t set, old;
         sigemptyset(&set);
@@ -164,10 +224,29 @@ static void accept_loop(int listen_fd) {
         if (rc != 0) {
             fprintf(stderr, "pthread_create: %s\n", strerror(rc));
             close(peer_fd);
+            stats_on_close();
             continue;
         }
         pthread_detach(t);
     }
+}
+
+static pthread_t start_telemetry(void) {
+    pthread_t t;
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &set, &old);
+
+    int rc = pthread_create(&t, NULL, stats_thread, NULL);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+
+    if (rc != 0) {
+        fprintf(stderr, "stats pthread_create: %s\n", strerror(rc));
+        exit(EXIT_FAILURE);
+    }
+
+    return t;
 }
 
 int main(int argc, char **argv) {
@@ -181,9 +260,13 @@ int main(int argc, char **argv) {
 
     int listen_fd = create_listener(address, port);
     install_sigint_handler();
+    pthread_t t = start_telemetry();
 
-    printf("Listenning to: %s:%u.\n", address, port);
+    printf("Listening to: %s:%u.\n", address, port);
     accept_loop(listen_fd);
+
+    //
+    pthread_join(t, NULL);
 
     close(listen_fd);
     return 0;

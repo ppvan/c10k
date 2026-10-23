@@ -8,12 +8,14 @@ SAN    = -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-
 all: debug release
 
 debug:
+	$(CC) $(CFLAGS) -O0 $(SAN) -o bin/client.out src/client.c
 	$(CC) $(CFLAGS) -O0 $(SAN) -o bin/server.out src/server.c
 
 tsan:
 	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o bin/server_tsan.out src/server.c
 
 release:
+	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o bin/client.out src/client.c
 	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o bin/server_rel.out src/server.c
 
 
