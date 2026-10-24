@@ -31,35 +31,38 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_EVENTS   1024
+#define MAX_EVENTS 1024
 #define HIST_BUCKETS 1024
-#define WHEEL_SLOTS  4096 /* 1 ms per slot; power of two */
-#define RX_BUF       65536
+#define WHEEL_SLOTS 4096 /* 1 ms per slot; power of two */
+#define RX_BUF 65536
+#define MAX_ADDRS 64
 
 enum conn_state { ST_IDLE, ST_CONNECTING, ST_INFLIGHT, ST_THINKING, ST_CLOSED };
 
 struct conn {
     int fd;
     enum conn_state state;
-    bool want_out;          /* EPOLLOUT currently registered for a partial send */
+    bool want_out; /* EPOLLOUT currently registered for a partial send */
     uint32_t wr_off, rd_off;
     uint64_t seq;
     uint64_t sent_ns;
     uint64_t due_ms;
     struct conn *next_timer;
-    unsigned char *msg;     /* the message in flight; echo is compared to it */
+    unsigned char *msg; /* the message in flight; echo is compared to it */
 };
 
 struct config {
-    struct sockaddr_storage addr;
-    socklen_t addrlen;
+    struct sockaddr_storage addrs[MAX_ADDRS];
+    socklen_t addrlens[MAX_ADDRS];
+    int naddrs;
     int conns, threads, duration_s, connect_rate;
     uint32_t msg_size, interval_ms;
 };
 
 /* Written only by the owning worker, read by main: relaxed atomics suffice. */
 struct stats {
-    _Atomic uint64_t active, connected, connect_fail, msgs, bytes, errors, mismatches;
+    _Atomic uint64_t active, connected, connect_fail, msgs, bytes, errors,
+        mismatches;
     _Atomic int last_connect_errno, last_errno;
 };
 
@@ -80,8 +83,12 @@ struct worker {
 };
 
 static struct config cfg = {
-    .conns = 10000, .threads = 2, .duration_s = 30,
-    .connect_rate = 5000, .msg_size = 64, .interval_ms = 0,
+    .conns = 10000,
+    .threads = 2,
+    .duration_s = 30,
+    .connect_rate = 5000,
+    .msg_size = 64,
+    .interval_ms = 0,
 };
 static atomic_bool stop_flag;
 static volatile sig_atomic_t got_sigint;
@@ -160,12 +167,14 @@ static void conn_close(struct worker *w, struct conn *c, int errnum) {
         return;
     if (c->state == ST_CONNECTING) {
         stat_add(&w->st.connect_fail, 1);
-        atomic_store_explicit(&w->st.last_connect_errno, errnum, memory_order_relaxed);
+        atomic_store_explicit(&w->st.last_connect_errno, errnum,
+                              memory_order_relaxed);
     } else {
         stat_add(&w->st.active, (uint64_t)-1);
         if (errnum >= 0) {
             stat_add(&w->st.errors, 1);
-            atomic_store_explicit(&w->st.last_errno, errnum, memory_order_relaxed);
+            atomic_store_explicit(&w->st.last_errno, errnum,
+                                  memory_order_relaxed);
         }
     }
     close(c->fd); /* also removes it from the epoll set */
@@ -211,7 +220,8 @@ static void do_send(struct worker *w, struct conn *c) {
 
 static void start_send(struct worker *w, struct conn *c) {
     /* Stamp the sequence number so each message differs from the last. */
-    size_t stamp = cfg.msg_size < sizeof(c->seq) ? cfg.msg_size : sizeof(c->seq);
+    size_t stamp =
+        cfg.msg_size < sizeof(c->seq) ? cfg.msg_size : sizeof(c->seq);
     memcpy(c->msg, &c->seq, stamp);
     c->wr_off = c->rd_off = 0;
     c->state = ST_INFLIGHT;
@@ -250,10 +260,15 @@ static void timer_run(struct worker *w, uint64_t now) {
 }
 
 static void conn_open(struct worker *w, struct conn *c) {
-    int fd = socket(cfg.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int i = (int)(c - w->conns);
+    const struct sockaddr_storage *a = &cfg.addrs[i % cfg.naddrs];
+    int fd =
+        socket(a->ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+
     if (fd < 0) {
         stat_add(&w->st.connect_fail, 1);
-        atomic_store_explicit(&w->st.last_connect_errno, errno, memory_order_relaxed);
+        atomic_store_explicit(&w->st.last_connect_errno, errno,
+                              memory_order_relaxed);
         c->state = ST_CLOSED;
         return;
     }
@@ -262,7 +277,8 @@ static void conn_open(struct worker *w, struct conn *c) {
 
     c->fd = fd;
     c->state = ST_CONNECTING;
-    if (connect(fd, (struct sockaddr *)&cfg.addr, cfg.addrlen) < 0 &&
+    if (connect(fd, (const struct sockaddr *)a, cfg.addrlens[i % cfg.naddrs]) <
+            0 &&
         errno != EINPROGRESS) {
         conn_close(w, c, errno);
         return;
@@ -287,7 +303,8 @@ static void on_connected(struct worker *w, struct conn *c) {
     set_events(w, c, EPOLLIN | EPOLLRDHUP);
 
     /* Spread the first sends over one interval to avoid a thundering herd. */
-    uint64_t delay = cfg.interval_ms ? xorshift32(&w->rng) % cfg.interval_ms + 1 : 0;
+    uint64_t delay =
+        cfg.interval_ms ? xorshift32(&w->rng) % cfg.interval_ms + 1 : 0;
     schedule_next(w, c, delay);
 }
 
@@ -402,15 +419,16 @@ static void *worker_main(void *arg) {
 /* ---------- setup ---------- */
 
 static void usage(const char *prog) {
-    fprintf(stderr,
-            "usage: %s [options] <address> <port>\n"
-            "  -c N   concurrent connections        (default 10000)\n"
-            "  -t N   worker threads                (default 2)\n"
-            "  -d S   test duration in seconds      (default 30)\n"
-            "  -s B   message size in bytes         (default 64)\n"
-            "  -i MS  think time between messages   (default 0 = flat out)\n"
-            "  -r N   new connections per second    (default 5000, 0 = no limit)\n",
-            prog);
+    fprintf(
+        stderr,
+        "usage: %s [options] <address> <port>\n"
+        "  -c N   concurrent connections        (default 10000)\n"
+        "  -t N   worker threads                (default 2)\n"
+        "  -d S   test duration in seconds      (default 30)\n"
+        "  -s B   message size in bytes         (default 64)\n"
+        "  -i MS  think time between messages   (default 0 = flat out)\n"
+        "  -r N   new connections per second    (default 5000, 0 = no limit)\n",
+        prog);
     exit(EXIT_FAILURE);
 }
 
@@ -422,18 +440,25 @@ static long parse_long(const char *s, long min, long max, const char *what) {
         errx(EXIT_FAILURE, "invalid %s: %s", what, s);
     return v;
 }
-
-static void resolve(const char *host, const char *port) {
-    struct addrinfo hints = {0}, *res;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0)
-        errx(EXIT_FAILURE, "address %s port %s: %s", host, port, gai_strerror(rc));
-    memcpy(&cfg.addr, res->ai_addr, res->ai_addrlen);
-    cfg.addrlen = res->ai_addrlen;
-    freeaddrinfo(res);
+static void resolve(const char *hosts, const char *port) {
+    char *list = strdup(hosts), *save = NULL;
+    for (char *h = strtok_r(list, ",", &save); h;
+         h = strtok_r(NULL, ",", &save)) {
+        if (cfg.naddrs == MAX_ADDRS)
+            errx(EXIT_FAILURE, "too many addresses (max %d)", MAX_ADDRS);
+        struct addrinfo hints = {0}, *res;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+        int rc = getaddrinfo(h, port, &hints, &res);
+        if (rc != 0)
+            errx(EXIT_FAILURE, "address %s port %s: %s", h, port,
+                 gai_strerror(rc));
+        memcpy(&cfg.addrs[cfg.naddrs], res->ai_addr, res->ai_addrlen);
+        cfg.addrlens[cfg.naddrs++] = res->ai_addrlen;
+        freeaddrinfo(res);
+    }
+    free(list);
 }
 
 static void raise_fd_limit(void) {
@@ -458,13 +483,29 @@ int main(int argc, char **argv) {
     int opt;
     while ((opt = getopt(argc, argv, "c:t:d:s:i:r:h")) != -1) {
         switch (opt) {
-        case 'c': cfg.conns = (int)parse_long(optarg, 1, 10000000, "connections"); break;
-        case 't': cfg.threads = (int)parse_long(optarg, 1, 1024, "threads"); break;
-        case 'd': cfg.duration_s = (int)parse_long(optarg, 1, 86400, "duration"); break;
-        case 's': cfg.msg_size = (uint32_t)parse_long(optarg, 1, 1 << 20, "message size"); break;
-        case 'i': cfg.interval_ms = (uint32_t)parse_long(optarg, 0, 3600000, "interval"); break;
-        case 'r': cfg.connect_rate = (int)parse_long(optarg, 0, 10000000, "connect rate"); break;
-        default: usage(argv[0]);
+        case 'c':
+            cfg.conns = (int)parse_long(optarg, 1, 10000000, "connections");
+            break;
+        case 't':
+            cfg.threads = (int)parse_long(optarg, 1, 1024, "threads");
+            break;
+        case 'd':
+            cfg.duration_s = (int)parse_long(optarg, 1, 86400, "duration");
+            break;
+        case 's':
+            cfg.msg_size =
+                (uint32_t)parse_long(optarg, 1, 1 << 20, "message size");
+            break;
+        case 'i':
+            cfg.interval_ms =
+                (uint32_t)parse_long(optarg, 0, 3600000, "interval");
+            break;
+        case 'r':
+            cfg.connect_rate =
+                (int)parse_long(optarg, 0, 10000000, "connect rate");
+            break;
+        default:
+            usage(argv[0]);
         }
     }
     if (argc - optind != 2)
@@ -513,11 +554,12 @@ int main(int argc, char **argv) {
         ws[t] = w;
     }
 
-    printf("target %d conns, %d threads, %u-byte msgs, think %u ms, ramp %d/s, %d s\n",
-           cfg.conns, cfg.threads, cfg.msg_size, cfg.interval_ms, cfg.connect_rate,
-           cfg.duration_s);
-    printf("%5s %8s %8s %8s %8s %10s %9s\n", "time", "active", "conn_ok", "conn_err",
-           "errors", "msgs/s", "MiB/s");
+    printf("target %d conns, %d threads, %u-byte msgs, think %u ms, ramp %d/s, "
+           "%d s\n",
+           cfg.conns, cfg.threads, cfg.msg_size, cfg.interval_ms,
+           cfg.connect_rate, cfg.duration_s);
+    printf("%5s %8s %8s %8s %8s %10s %9s\n", "time", "active", "conn_ok",
+           "conn_err", "errors", "msgs/s", "MiB/s");
 
     uint64_t t0 = now_ms();
     for (int t = 0; t < cfg.threads; t++) {
@@ -564,7 +606,8 @@ int main(int argc, char **argv) {
     double elapsed = (double)(now_ms() - t0) / 1000.0;
 
     static uint64_t hist[HIST_BUCKETS];
-    uint64_t ok = 0, cfail = 0, errs = 0, mism = 0, msgs = 0, bytes = 0, max_us = 0;
+    uint64_t ok = 0, cfail = 0, errs = 0, mism = 0, msgs = 0, bytes = 0,
+             max_us = 0;
     int last_cerr = 0, last_err = 0;
     for (int t = 0; t < cfg.threads; t++) {
         struct worker *w = ws[t];
@@ -588,9 +631,9 @@ int main(int argc, char **argv) {
     printf("connections: %llu ok, %llu failed%s%s\n", (unsigned long long)ok,
            (unsigned long long)cfail, last_cerr ? ", last error: " : "",
            last_cerr ? strerror(last_cerr) : "");
-    printf("errors:      %llu%s%s, echo mismatches: %llu\n", (unsigned long long)errs,
-           last_err ? ", last: " : "", last_err ? strerror(last_err) : "",
-           (unsigned long long)mism);
+    printf("errors:      %llu%s%s, echo mismatches: %llu\n",
+           (unsigned long long)errs, last_err ? ", last: " : "",
+           last_err ? strerror(last_err) : "", (unsigned long long)mism);
     printf("messages:    %llu (%.0f msg/s, %.2f MiB/s echoed)\n",
            (unsigned long long)msgs, (double)msgs / elapsed,
            (double)bytes / elapsed / (1024.0 * 1024.0));

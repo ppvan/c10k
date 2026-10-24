@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +29,12 @@ static _Atomic uint64_t total_accepted;
 static _Atomic uint64_t total_closed;
 static atomic_long active;
 static atomic_long peak;
+static _Atomic uint64_t total_bytes_sent = 0;
+static _Atomic uint64_t total_send_calls = 0;
+static _Atomic uint64_t total_bytes_recv = 0;
+static _Atomic uint64_t total_recv_calls = 0;
+static _Atomic uint64_t create_fail;
+static _Atomic int last_create_err;
 
 static void stats_on_accept(void) {
     atomic_fetch_add_explicit(&total_accepted, 1, memory_order_relaxed);
@@ -52,6 +59,27 @@ static void stats_on_close(void) {
     atomic_fetch_sub_explicit(&active, 1, memory_order_relaxed);
 }
 
+static void stats_on_send(uint64_t bytes) {
+    atomic_fetch_add_explicit(&total_bytes_sent, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&total_send_calls, 1, memory_order_relaxed);
+}
+
+static void stats_on_recv(uint64_t bytes) {
+    atomic_fetch_add_explicit(&total_bytes_recv, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&total_recv_calls, 1, memory_order_relaxed);
+}
+
+static void print_self_status(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "Threads:", 8) || !strncmp(line, "VmRSS:", 6) ||
+            !strncmp(line, "VmSize:", 7))
+            fputs(line, stdout);
+    fclose(f);
+}
+
 static void *stats_thread(void *arg) {
     (void)arg;
     while (atomic_load_explicit(&running, memory_order_relaxed)) {
@@ -63,6 +91,13 @@ static void *stats_thread(void *arg) {
                                                         memory_order_relaxed),
                (unsigned long long)atomic_load_explicit(&total_closed,
                                                         memory_order_relaxed));
+        printf("sent=%lu sent_bytes=%lu recv=%lu recv_bytes=%lu\n",
+               atomic_load_explicit(&total_send_calls, memory_order_relaxed),
+               atomic_load_explicit(&total_bytes_sent, memory_order_relaxed),
+               atomic_load_explicit(&total_recv_calls, memory_order_relaxed),
+               atomic_load_explicit(&total_bytes_recv, memory_order_relaxed));
+
+        print_self_status();
     }
 
     return NULL;
@@ -79,12 +114,15 @@ static int send_all(int fd, const char *buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
+                stats_on_send(0);
                 continue;
+            }
 
             return -1;
         }
         buf += n;
+        stats_on_send((uint64_t)n);
         len -= (size_t)n;
     }
 
@@ -98,6 +136,7 @@ static void *handle_client(void *arg) {
     for (;;) {
         ssize_t bytes_read = recv(peer_fd, echo_buf, sizeof(echo_buf), 0);
         if (bytes_read < 0 && errno == EINTR) {
+            stats_on_recv(0);
             continue;
         }
 
@@ -105,6 +144,7 @@ static void *handle_client(void *arg) {
             break;
         }
 
+        stats_on_recv((uint64_t)bytes_read);
         if (send_all(peer_fd, echo_buf, (size_t)bytes_read) < 0) {
             break;
         }
@@ -189,24 +229,39 @@ static void install_sigint_handler(void) {
     }
 }
 
+static bool accept_error_is_fatal(int e) {
+    switch (e) {
+    case EBADF:    // listen_fd isn't a valid fd
+    case ENOTSOCK: // listen_fd isn't a socket
+    case EINVAL:   // socket isn't listening
+    case EFAULT:   // bad addr pointer (can't happen with NULL)
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void accept_loop(int listen_fd) {
     int peer_fd;
     while (atomic_load_explicit(&running, memory_order_relaxed)) {
         pthread_t t;
         peer_fd = accept(listen_fd, NULL, NULL);
         if (peer_fd < 0) {
-            if (errno == ECONNABORTED || errno == EINTR || errno == EAGAIN) {
+            int e = errno; // save it: warn()/strerror() may clobber errno
+
+            // 1. Nothing wrong, just try again
+            if (e == EINTR || e == EAGAIN || e == EWOULDBLOCK ||
+                e == ECONNABORTED)
                 continue;
-            }
-            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
-                errno == ENOMEM) {
+
+            if (e == EMFILE || e == ENFILE || e == ENOBUFS || e == ENOMEM) {
                 warn("accept");
                 sleep(1);
                 continue;
             }
 
-            else {
-                err(EXIT_FAILURE, "Accept failed");
+            if (accept_error_is_fatal(e)) {
+                err(e, "accept");
             }
         }
 
@@ -223,6 +278,8 @@ static void accept_loop(int listen_fd) {
 
         if (rc != 0) {
             fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+            atomic_fetch_add_explicit(&create_fail, 1, memory_order_relaxed);
+            atomic_store_explicit(&last_create_err, rc, memory_order_relaxed);
             close(peer_fd);
             stats_on_close();
             continue;

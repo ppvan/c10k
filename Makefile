@@ -5,7 +5,7 @@ SAN    = -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-
 
 .PHONY: all debug tsan release clean
 
-all: debug release
+all: debug
 
 debug:
 	$(CC) $(CFLAGS) -O0 $(SAN) -o bin/client.out src/client.c
