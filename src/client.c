@@ -636,11 +636,11 @@ int main(int argc, char **argv) {
     printf("messages:    %llu (%.0f msg/s, %.2f MiB/s echoed)\n",
            (unsigned long long)msgs, (double)msgs / elapsed,
            (double)bytes / elapsed / (1024.0 * 1024.0));
-    printf("latency us:  p50 %llu  p90 %llu  p99 %llu  p99.9 %llu  max %llu\n",
-           (unsigned long long)hist_percentile(hist, msgs, 0.50),
-           (unsigned long long)hist_percentile(hist, msgs, 0.90),
-           (unsigned long long)hist_percentile(hist, msgs, 0.99),
-           (unsigned long long)hist_percentile(hist, msgs, 0.999),
+    printf("latency ms:  p50 %llu  p90 %llu  p99 %llu  p99.9 %llu  max %llu\n",
+           (unsigned long long)hist_percentile(hist, msgs, 0.50) / 1000,
+           (unsigned long long)hist_percentile(hist, msgs, 0.90) / 1000,
+           (unsigned long long)hist_percentile(hist, msgs, 0.99) / 1000,
+           (unsigned long long)hist_percentile(hist, msgs, 0.999) / 1000,
            (unsigned long long)max_us);
 
     return (mism > 0 || cfail > 0) ? 1 : 0;
