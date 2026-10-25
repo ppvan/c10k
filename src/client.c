@@ -10,7 +10,6 @@
  * Build: gcc -O2 -Wall -Wextra -pthread -o c10k_bench c10k_bench.c
  * Usage: ./c10k_bench [options] <address> <port>
  */
-#define _GNU_SOURCE
 #include <err.h>
 #include <errno.h>
 #include <getopt.h>

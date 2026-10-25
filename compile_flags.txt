@@ -5,3 +5,4 @@
 -Wshadow
 -Wconversion
 -pthread
+-D_GNU_SOURCE
