@@ -10,13 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #define BUF_SIZE 1024
-#define MAX_FDS 1048576
 
 struct config {
     const char *address;
@@ -27,7 +27,6 @@ struct config {
 
 struct connection_t {
     int fd;
-    size_t idx;
     char buf[BUF_SIZE];
     size_t len, off;
 };
@@ -43,17 +42,29 @@ struct handler {
 struct loop {
     struct pollfd *fds;
     struct handler *handlers;
+    size_t *slot_of; // slot_of[fd] = index into fds/handlers
 
     nfds_t count;
     nfds_t cap;
 };
 
-static struct loop *loop_init(void) {
+static struct loop *loop_init(struct config cfg) {
     struct loop *l = malloc(sizeof(struct loop));
     l->cap = 256;
     l->count = 0;
     l->fds = malloc(sizeof(struct pollfd) * l->cap);
     l->handlers = malloc(sizeof(struct handler) * l->cap);
+
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) == -1) {
+        err(EXIT_FAILURE, "can't get rlimit");
+    }
+    if (cfg.verbose) {
+        printf("file limit: %lu\n", limit.rlim_cur);
+    }
+
+    l->slot_of = malloc(limit.rlim_cur * sizeof(size_t));
+    memset(l->slot_of, 0, limit.rlim_cur * sizeof(size_t));
 
     return l;
 }
@@ -67,26 +78,30 @@ static size_t loop_add(struct loop *l, int fd, event_cb cb, short events,
         l->handlers = realloc(l->handlers, sizeof(struct handler) * l->cap);
     }
 
-    size_t idx = l->count;
+    size_t idx = l->count++;
     l->fds[idx].events = events;
     l->fds[idx].fd = fd;
+    l->slot_of[fd] = idx;
 
     l->handlers[idx].cb = cb;
     l->handlers[idx].ctx = ctx;
 
-    l->count++;
-
     return idx;
 }
 
-static void loop_set_events(struct loop *l, size_t idx, short events) {
-    l->fds[idx].events = events;
+static void loop_set_events(struct loop *l, int fd, short events) {
+    l->fds[l->slot_of[fd]].events = events;
 }
 
-static void loop_remove(struct loop *l, size_t idx) {
-    size_t n = l->count;
-    l->fds[idx] = l->fds[n - 1];
-    l->handlers[idx] = l->handlers[n - 1];
+static void loop_remove(struct loop *l, int fd) {
+
+    size_t idx = l->slot_of[fd];
+    size_t last = l->count - 1;
+    if (idx != last) {
+        l->fds[idx] = l->fds[last];
+        l->handlers[idx] = l->handlers[last];
+        l->slot_of[l->fds[idx].fd] = idx;
+    }
     l->count--;
 
     if (l->count <= l->cap / 4 && l->cap > 256) {
@@ -94,11 +109,10 @@ static void loop_remove(struct loop *l, size_t idx) {
         l->fds = realloc(l->fds, sizeof(struct pollfd) * l->cap);
         l->handlers = realloc(l->handlers, sizeof(struct handler) * l->cap);
     }
-
 }
 
 void conn_close(struct loop *l, struct connection_t *c) {
-    loop_remove(l, c->idx);
+    loop_remove(l, c->fd);
     close(c->fd);
     free(c);
 }
@@ -135,7 +149,7 @@ static void on_client(struct loop *l, void *ctx, short revents) {
 
         c->off = 0;
         c->len = (size_t)ret;
-        loop_set_events(l, c->idx, POLLOUT);
+        loop_set_events(l, c->fd, POLLOUT);
     } else if (revents & POLLOUT) {
         ssize_t ret = send(c->fd, c->buf + c->off, (size_t)(c->len - c->off),
                            MSG_NOSIGNAL);
@@ -146,7 +160,7 @@ static void on_client(struct loop *l, void *ctx, short revents) {
 
         c->off += (size_t)ret;
         if (c->off == c->len) {
-            loop_set_events(l, c->idx, POLLIN);
+            loop_set_events(l, c->fd, POLLIN);
         }
     }
 }
@@ -166,8 +180,8 @@ void on_accept(struct loop *l, void *ctx, short revents) {
             } else if (errno == EINTR) {
                 continue;
             } else if (errno == EMFILE) {
-                warn("too many open files");
-                continue;
+                fprintf(stderr, "too many open files");
+                return;
             } else {
                 err(EXIT_FAILURE, "can't accept any more");
                 return;
@@ -176,7 +190,7 @@ void on_accept(struct loop *l, void *ctx, short revents) {
         struct connection_t *conn = calloc(sizeof(struct connection_t), 1);
 
         conn->fd = peer_fd;
-        conn->idx = loop_add(l, peer_fd, on_client, POLLIN, conn);
+        loop_add(l, peer_fd, on_client, POLLIN, conn);
     }
 }
 
@@ -219,7 +233,7 @@ int main(int argc, char **argv) {
     printf("Listening on %s:%u (backlog %d)%s\n", cfg.address, cfg.port,
            cfg.backlog, cfg.verbose ? " [verbose]" : "");
 
-    struct loop *l = loop_init();
+    struct loop *l = loop_init(cfg);
     loop_add(l, listen_fd, on_accept, POLLIN, (void *)(intptr_t)listen_fd);
     loop_run(l);
     close(listen_fd);
