@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #define BUF_SIZE 1024
+#define MAX_FDS 1048576
 
 struct config {
     const char *address;
@@ -25,15 +26,163 @@ struct config {
 };
 
 struct connection_t {
-    char *buf;
-    size_t len;
-    size_t offset;
+    int fd;
+    size_t idx;
+    char buf[BUF_SIZE];
+    size_t len, off;
 };
+
+struct loop;
+typedef void (*event_cb)(struct loop *l, void *ctx, short revents);
+
+struct handler {
+    event_cb cb;
+    void *ctx;
+};
+
+struct loop {
+    struct pollfd *fds;
+    struct handler *handlers;
+
+    nfds_t count;
+    nfds_t cap;
+};
+
+static struct loop *loop_init(void) {
+    struct loop *l = malloc(sizeof(struct loop));
+    l->cap = 256;
+    l->count = 0;
+    l->fds = malloc(sizeof(struct pollfd) * l->cap);
+    l->handlers = malloc(sizeof(struct handler) * l->cap);
+
+    return l;
+}
+
+static size_t loop_add(struct loop *l, int fd, event_cb cb, short events,
+                       void *ctx) {
+
+    if (l->count >= l->cap) {
+        l->cap = l->cap * 2;
+        l->fds = realloc(l->fds, sizeof(struct pollfd) * l->cap);
+        l->handlers = realloc(l->handlers, sizeof(struct handler) * l->cap);
+    }
+
+    size_t idx = l->count;
+    l->fds[idx].events = events;
+    l->fds[idx].fd = fd;
+
+    l->handlers[idx].cb = cb;
+    l->handlers[idx].ctx = ctx;
+
+    l->count++;
+
+    return idx;
+}
+
+static void loop_set_events(struct loop *l, size_t idx, short events) {
+    l->fds[idx].events = events;
+}
+
+static void loop_remove(struct loop *l, size_t idx) {
+    size_t n = l->count;
+    l->fds[idx] = l->fds[n - 1];
+    l->handlers[idx] = l->handlers[n - 1];
+    l->count--;
+
+    if (l->count <= l->cap / 4 && l->cap > 256) {
+        l->cap = l->cap / 2;
+        l->fds = realloc(l->fds, sizeof(struct pollfd) * l->cap);
+        l->handlers = realloc(l->handlers, sizeof(struct handler) * l->cap);
+    }
+
+}
+
+void conn_close(struct loop *l, struct connection_t *c) {
+    loop_remove(l, c->idx);
+    close(c->fd);
+    free(c);
+}
+
+static void loop_run(struct loop *l) {
+    struct timespec tv = {.tv_sec = 1};
+    for (;;) {
+        int active_fds = ppoll(l->fds, l->count, &tv, NULL);
+        if (active_fds < 0) {
+            err(EXIT_FAILURE, "ppoll");
+        }
+
+        // Dispatch backwards, so remove not skip dispatch
+        ssize_t n = (ssize_t)l->count;
+        for (ssize_t i = n - 1; i >= 0; i--) {
+            if (l->fds[i].revents) {
+                l->handlers[i].cb(l, l->handlers[i].ctx, l->fds[i].revents);
+            }
+        }
+    }
+}
+
+static void on_client(struct loop *l, void *ctx, short revents) {
+    struct connection_t *c = (struct connection_t *)ctx;
+
+    if (revents & (POLLHUP | POLLERR)) {
+        conn_close(l, c);
+    } else if (revents & POLLIN) {
+        ssize_t ret = recv(c->fd, c->buf, sizeof(c->buf), 0);
+        if (ret <= 0) {
+            conn_close(l, c);
+            return;
+        }
+
+        c->off = 0;
+        c->len = (size_t)ret;
+        loop_set_events(l, c->idx, POLLOUT);
+    } else if (revents & POLLOUT) {
+        ssize_t ret = send(c->fd, c->buf + c->off, (size_t)(c->len - c->off),
+                           MSG_NOSIGNAL);
+        if (ret <= 0) {
+            conn_close(l, c);
+            return;
+        }
+
+        c->off += (size_t)ret;
+        if (c->off == c->len) {
+            loop_set_events(l, c->idx, POLLIN);
+        }
+    }
+}
+
+void on_accept(struct loop *l, void *ctx, short revents) {
+    (void)revents;
+    int listen_fd = (int)(intptr_t)ctx;
+
+    while (true) {
+        int peer_fd =
+            accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (peer_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No connections are ready right now.
+                // Simply return to your event loop or do other work.
+                return;
+            } else if (errno == EINTR) {
+                continue;
+            } else if (errno == EMFILE) {
+                warn("too many open files");
+                continue;
+            } else {
+                err(EXIT_FAILURE, "can't accept any more");
+                return;
+            }
+        }
+        struct connection_t *conn = calloc(sizeof(struct connection_t), 1);
+
+        conn->fd = peer_fd;
+        conn->idx = loop_add(l, peer_fd, on_client, POLLIN, conn);
+    }
+}
 
 static void usage(const char *prog, int status);
 static long parse_long(const char *raw, const char *what, long min, long max);
 static int make_listener(const struct config *cfg);
-static void poll_loop(int listen_fd, const struct config *cfg);
 
 int main(int argc, char **argv) {
     struct config cfg = {
@@ -70,10 +219,11 @@ int main(int argc, char **argv) {
     printf("Listening on %s:%u (backlog %d)%s\n", cfg.address, cfg.port,
            cfg.backlog, cfg.verbose ? " [verbose]" : "");
 
-    // install_sigint_handler();
-    poll_loop(listen_fd, &cfg);
-
+    struct loop *l = loop_init();
+    loop_add(l, listen_fd, on_accept, POLLIN, (void *)(intptr_t)listen_fd);
+    loop_run(l);
     close(listen_fd);
+
     return EXIT_SUCCESS;
 }
 
@@ -144,107 +294,4 @@ static int make_listener(const struct config *cfg) {
                 cfg->port);
 
     return fd;
-}
-
-static void poll_loop(int listen_fd, const struct config *cfg) {
-    // 1. listen to listen fd for readable signal
-    // 2. If new signal in, accept()
-    //    alloc new buf, fd to new client
-    // ....keep  the client somewhere
-    // 3. polling
-    // 4. If client is readable, read it as much as you can to its buf, subcribe
-    // to writes on this socket
-    // 5. If client is writeable, write as much as you can, if done -> unsub
-    // write event
-    // 6. What if we did not complete write yet, but client keep send new data?
-    //   Trust TCP we retransmit, since we don't  read TCP would resend it or in
-    //   the buffer somewhere, don't care about this case yet.
-
-    // Need an array of pollfd. Hard cap to 100 cons array for simplicity,
-    // dynamic array later.
-    nfds_t nfds = 100;
-    nfds_t count = 1;
-    struct pollfd *fds = malloc(nfds * sizeof(struct pollfd));
-    struct connection_t *connections =
-        malloc((nfds - 1) * sizeof(struct connection_t));
-    struct timespec tv;
-    tv.tv_sec = 1;
-
-    fds[0].events = POLLIN;
-    fds[0].fd = listen_fd;
-
-    while (true) {
-        int active_fds = ppoll(fds, count, &tv, NULL);
-        switch (active_fds) {
-        case 0:
-            if (cfg->verbose) {
-                printf("ppoll timeout\n");
-            }
-            break;
-        case -1:
-            err(EXIT_FAILURE, "ppoll");
-            break;
-        default:
-            if (fds[0].revents & POLLERR) {
-                err(EXIT_FAILURE, "listen_fd err");
-            }
-            if (fds[0].revents & POLLIN) {
-                int peer_fd = accept(listen_fd, NULL, NULL);
-                if (count >= nfds) {
-                    err(EXIT_FAILURE, "Too many connection");
-                }
-
-                connections[count - 1].buf = malloc(BUF_SIZE);
-                connections[count - 1].len = BUF_SIZE;
-                connections[count - 1].offset = 0;
-
-                fds[count].events = POLLIN;
-                fds[count].fd = peer_fd;
-
-                count++;
-                continue;
-            }
-
-            for (size_t i = 1; i < count; i++) {
-
-                if (fds[0].revents & POLLERR) {
-                    err(EXIT_FAILURE, "peer fd err");
-                }
-
-                if (fds[i].revents & POLLIN) {
-                    ssize_t rlen = recv(fds[i].fd, connections[i - 1].buf,
-                                        connections[i - 1].len, 0);
-                    if (rlen <= 0) {
-                        fprintf(stderr, "client read error\n");
-                        close(fds[i].fd);
-                        exit(1);
-                    }
-
-                    connections[i - 1].len = (size_t)rlen;
-                    connections[i - 1].offset = 0;
-                    fds[i].events = POLLOUT;
-                }
-
-                if (fds[i].revents & POLLOUT) {
-
-                    if (connections[i - 1].offset < connections[i - 1].len) {
-                        ssize_t wlen = send(fds[i].fd,
-                                            connections[i - 1].buf +
-                                                connections[i - 1].offset,
-                                            connections[i - 1].len, 0);
-                        if (wlen <= 0) {
-                            fprintf(stderr, "client read error\n");
-                            close(fds[i].fd);
-                            exit(1);
-                        }
-                        connections[i - 1].offset += (size_t)wlen;
-                    } else {
-                        connections[i - 1].offset = 0;
-                        fds[i].events = POLLIN;
-                    }
-                }
-            }
-            break;
-        }
-    }
 }
