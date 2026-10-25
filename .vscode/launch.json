@@ -5,7 +5,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug server",
-      "program": "${workspaceFolder}/bin/server_poll_tsan.out",
+      "program": "${workspaceFolder}/build/debug/test/loop/timers_heap_test",
       "args": ["127.0.0.1", "8080"],
       "cwd": "${workspaceFolder}",
       "env": {
