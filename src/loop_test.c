@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ANSI terminal colors */
 #define GREEN "\033[32m"
@@ -31,6 +32,26 @@ static int tests_passed = 0;
         tests_passed++;                                                        \
     } while (0)
 
+
+/* ---------------------------------------------------------
+ * Helpers
+ * --------------------------------------------------------- */
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    int rc = clock_gettime(CLOCK_MONOTONIC, &ts);
+    assert(rc == 0);
+
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void increment_cb(struct loop *l, void *userdata) {
+    (void)l;
+    int *count = userdata;
+    (*count)++;
+}
+
+
 /* ---------------------------------------------------------
  * Invariant verification
  * --------------------------------------------------------- */
@@ -52,7 +73,7 @@ static void verify_heap(const struct timers_heap *h) {
         if (i > 0) {
             size_t parent = (i - 1) / 2;
 
-            assert(h->items[parent]->deadline_ns <= t->deadline_ns);
+            assert(h->items[parent]->deadline_ms <= t->deadline_ms);
         }
     }
 }
@@ -77,7 +98,7 @@ static void test_single(void) {
     struct timers_heap h;
     timers_heap_init(&h);
 
-    struct timer t = {.deadline_ns = 100};
+    struct timer t = {.deadline_ms = 100};
 
     timers_heap_push(&h, &t);
 
@@ -98,8 +119,8 @@ static void test_sorted_order(void) {
     timers_heap_init(&h);
 
     struct timer timers[] = {
-        {.deadline_ns = 50}, {.deadline_ns = 10}, {.deadline_ns = 40},
-        {.deadline_ns = 20}, {.deadline_ns = 30},
+        {.deadline_ms = 50}, {.deadline_ms = 10}, {.deadline_ms = 40},
+        {.deadline_ms = 20}, {.deadline_ms = 30},
     };
 
     for (size_t i = 0; i < ARRAY_LEN(timers); i++) {
@@ -108,13 +129,13 @@ static void test_sorted_order(void) {
     }
 
     assert(h.count == ARRAY_LEN(timers));
-    assert(timers_heap_peek(&h)->deadline_ns == 10);
+    assert(timers_heap_peek(&h)->deadline_ms == 10);
 
     for (uint64_t expected = 10; expected <= 50; expected += 10) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns == expected);
+        assert(t->deadline_ms == expected);
         verify_heap(&h);
     }
 
@@ -129,10 +150,10 @@ static void test_duplicates(void) {
     timers_heap_init(&h);
 
     struct timer timers[] = {
-        {.deadline_ns = 10},
-        {.deadline_ns = 10},
-        {.deadline_ns = 5},
-        {.deadline_ns = 5},
+        {.deadline_ms = 10},
+        {.deadline_ms = 10},
+        {.deadline_ms = 5},
+        {.deadline_ms = 5},
     };
 
     for (size_t i = 0; i < ARRAY_LEN(timers); i++) {
@@ -146,7 +167,7 @@ static void test_duplicates(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns == expected[i]);
+        assert(t->deadline_ms == expected[i]);
         verify_heap(&h);
     }
 
@@ -161,7 +182,7 @@ static void test_ascending_insert(void) {
     struct timer timers[N] = {0};
 
     for (size_t i = 0; i < N; i++) {
-        timers[i].deadline_ns = i;
+        timers[i].deadline_ms = i;
         timers_heap_push(&h, &timers[i]);
         verify_heap(&h);
     }
@@ -182,7 +203,7 @@ static void test_descending_insert(void) {
     struct timer timers[N] = {0};
 
     for (size_t i = 0; i < N; i++) {
-        timers[i].deadline_ns = N - i;
+        timers[i].deadline_ms = N - i;
         timers_heap_push(&h, &timers[i]);
         verify_heap(&h);
     }
@@ -191,7 +212,7 @@ static void test_descending_insert(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns == expected);
+        assert(t->deadline_ms == expected);
         verify_heap(&h);
     }
 
@@ -207,10 +228,10 @@ static void test_uint64_boundaries(void) {
     timers_heap_init(&h);
 
     struct timer timers[] = {
-        {.deadline_ns = UINT64_MAX},
-        {.deadline_ns = 0},
-        {.deadline_ns = UINT64_MAX - 1},
-        {.deadline_ns = 1},
+        {.deadline_ms = UINT64_MAX},
+        {.deadline_ms = 0},
+        {.deadline_ms = UINT64_MAX - 1},
+        {.deadline_ms = 1},
     };
 
     for (size_t i = 0; i < ARRAY_LEN(timers); i++) {
@@ -224,7 +245,7 @@ static void test_uint64_boundaries(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns == expected[i]);
+        assert(t->deadline_ms == expected[i]);
         verify_heap(&h);
     }
 
@@ -239,7 +260,7 @@ static void test_all_equal(void) {
     struct timer timers[N] = {0};
 
     for (size_t i = 0; i < N; i++) {
-        timers[i].deadline_ns = 42;
+        timers[i].deadline_ms = 42;
         timers_heap_push(&h, &timers[i]);
         verify_heap(&h);
     }
@@ -248,7 +269,7 @@ static void test_all_equal(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns == 42);
+        assert(t->deadline_ms == 42);
         verify_heap(&h);
     }
 
@@ -259,8 +280,8 @@ static void test_peek_does_not_remove(void) {
     struct timers_heap h;
     timers_heap_init(&h);
 
-    struct timer a = {.deadline_ns = 20};
-    struct timer b = {.deadline_ns = 10};
+    struct timer a = {.deadline_ms = 20};
+    struct timer b = {.deadline_ms = 10};
 
     timers_heap_push(&h, &a);
     timers_heap_push(&h, &b);
@@ -278,8 +299,8 @@ static void test_reuse_after_empty(void) {
     struct timers_heap h;
     timers_heap_init(&h);
 
-    struct timer a = {.deadline_ns = 100};
-    struct timer b = {.deadline_ns = 50};
+    struct timer a = {.deadline_ms = 100};
+    struct timer b = {.deadline_ms = 50};
 
     timers_heap_push(&h, &a);
     assert(timers_heap_pop(&h) == &a);
@@ -298,12 +319,12 @@ static void test_reinsert_same_timer(void) {
     struct timers_heap h;
     timers_heap_init(&h);
 
-    struct timer t = {.deadline_ns = 100};
+    struct timer t = {.deadline_ms = 100};
 
     timers_heap_push(&h, &t);
     assert(timers_heap_pop(&h) == &t);
 
-    t.deadline_ns = 5;
+    t.deadline_ms = 5;
 
     timers_heap_push(&h, &t);
     assert(timers_heap_peek(&h) == &t);
@@ -318,10 +339,10 @@ static void test_interleaved_operations(void) {
     struct timers_heap h;
     timers_heap_init(&h);
 
-    struct timer a = {.deadline_ns = 30};
-    struct timer b = {.deadline_ns = 10};
-    struct timer c = {.deadline_ns = 20};
-    struct timer d = {.deadline_ns = 5};
+    struct timer a = {.deadline_ms = 30};
+    struct timer b = {.deadline_ms = 10};
+    struct timer c = {.deadline_ms = 20};
+    struct timer d = {.deadline_ms = 5};
 
     timers_heap_push(&h, &a);
     timers_heap_push(&h, &b);
@@ -357,7 +378,7 @@ static void test_large_growth(void) {
     assert(timers != NULL);
 
     for (size_t i = 0; i < N; i++) {
-        timers[i].deadline_ns = N - i;
+        timers[i].deadline_ms = N - i;
         timers_heap_push(&h, &timers[i]);
     }
 
@@ -369,7 +390,7 @@ static void test_large_growth(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns == expected);
+        assert(t->deadline_ms == expected);
     }
 
     assert(h.count == 0);
@@ -398,7 +419,7 @@ static void test_randomized_order(void) {
     assert(timers != NULL);
 
     for (size_t i = 0; i < N; i++) {
-        timers[i].deadline_ns = next_random() % 1000;
+        timers[i].deadline_ms = next_random() % 1000;
         timers_heap_push(&h, &timers[i]);
     }
 
@@ -410,9 +431,9 @@ static void test_randomized_order(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns >= previous);
+        assert(t->deadline_ms >= previous);
 
-        previous = t->deadline_ns;
+        previous = t->deadline_ms;
     }
 
     assert(h.count == 0);
@@ -438,7 +459,7 @@ static void test_randomized_interleaving(void) {
         bool can_pop = h.count > 0;
 
         if (can_push && (!can_pop || (next_random() & 1))) {
-            timers[inserted].deadline_ns = next_random();
+            timers[inserted].deadline_ms = next_random();
             timers_heap_push(&h, &timers[inserted]);
             inserted++;
         } else if (can_pop) {
@@ -457,13 +478,277 @@ static void test_randomized_interleaving(void) {
         struct timer *t = timers_heap_pop(&h);
 
         assert(t != NULL);
-        assert(t->deadline_ns >= previous);
-        previous = t->deadline_ns;
+        assert(t->deadline_ms >= previous);
+        previous = t->deadline_ms;
     }
 
     timers_heap_destroy(&h);
     free(timers);
 }
+
+/* ---------------------------------------------------------
+ * Basic tests
+ * --------------------------------------------------------- */
+
+static void test_init_destroy(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+    loop_destroy(l);
+}
+
+static void test_empty_loop(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    uint64_t start = monotonic_ms();
+    loop_run(l);
+    uint64_t elapsed = monotonic_ms() - start;
+
+    assert(elapsed < 100);
+
+    loop_destroy(l);
+}
+
+static void test_single_timer(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    int count = 0;
+
+    loop_timer_add(l, 10, increment_cb, &count);
+    loop_run(l);
+
+    assert(count == 1);
+
+    loop_destroy(l);
+}
+
+/* ---------------------------------------------------------
+ * Timer ordering
+ * --------------------------------------------------------- */
+
+struct order_ctx {
+    int values[16];
+    size_t count;
+};
+
+struct order_event {
+    struct order_ctx *ctx;
+    int value;
+};
+
+static void order_cb(struct loop *l, void *userdata) {
+    (void)l;
+
+    struct order_event *event = userdata;
+    struct order_ctx *ctx = event->ctx;
+
+    assert(ctx->count < ARRAY_LEN(ctx->values));
+    ctx->values[ctx->count++] = event->value;
+}
+
+static void test_timer_order(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    struct order_ctx ctx = {0};
+
+    struct order_event events[] = {
+        {&ctx, 5}, {&ctx, 1}, {&ctx, 3}, {&ctx, 2}, {&ctx, 4},
+    };
+
+    loop_timer_add(l, 50, order_cb, &events[0]);
+    loop_timer_add(l, 10, order_cb, &events[1]);
+    loop_timer_add(l, 30, order_cb, &events[2]);
+    loop_timer_add(l, 20, order_cb, &events[3]);
+    loop_timer_add(l, 40, order_cb, &events[4]);
+
+    loop_run(l);
+
+    assert(ctx.count == 5);
+
+    for (size_t i = 0; i < ctx.count; i++) {
+        assert(ctx.values[i] == (int)i + 1);
+    }
+
+    loop_destroy(l);
+}
+
+static void test_same_deadline(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    enum { N = 100 };
+    int count = 0;
+
+    for (int i = 0; i < N; i++) {
+        loop_timer_add(l, 10, increment_cb, &count);
+    }
+
+    loop_run(l);
+
+    assert(count == N);
+
+    /* Equal deadlines do not imply stable ordering. */
+
+    loop_destroy(l);
+}
+
+/* ---------------------------------------------------------
+ * Callback behavior
+ * --------------------------------------------------------- */
+
+static void test_userdata(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    int a = 0;
+    int b = 10;
+    int c = 100;
+
+    loop_timer_add(l, 10, increment_cb, &a);
+    loop_timer_add(l, 10, increment_cb, &b);
+    loop_timer_add(l, 10, increment_cb, &c);
+
+    loop_run(l);
+
+    assert(a == 1);
+    assert(b == 11);
+    assert(c == 101);
+
+    loop_destroy(l);
+}
+
+static void test_zero_delay_timer(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    int count = 0;
+
+    loop_timer_add(l, 0, increment_cb, &count);
+    loop_run(l);
+
+    assert(count == 1);
+
+    loop_destroy(l);
+}
+
+/* ---------------------------------------------------------
+ * Timing correctness
+ * --------------------------------------------------------- */
+
+struct timing_ctx {
+    uint64_t fired_at;
+    int count;
+};
+
+static void timing_cb(struct loop *l, void *userdata) {
+    (void)l;
+
+    struct timing_ctx *ctx = userdata;
+    ctx->fired_at = monotonic_ms();
+    ctx->count++;
+}
+
+static void test_timer_not_early(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    struct timing_ctx ctx = {0};
+
+    uint64_t start = monotonic_ms();
+
+    loop_timer_add(l, 50, timing_cb, &ctx);
+    loop_run(l);
+
+    assert(ctx.count == 1);
+    assert(ctx.fired_at >= start);
+    assert(ctx.fired_at - start >= 50);
+
+    loop_destroy(l);
+}
+
+/* ---------------------------------------------------------
+ * Dynamic scheduling
+ * --------------------------------------------------------- */
+
+struct chain_ctx {
+    int count;
+    int target;
+};
+
+static void chain_cb(struct loop *l, void *userdata) {
+    struct chain_ctx *ctx = userdata;
+
+    ctx->count++;
+
+    if (ctx->count < ctx->target) {
+        loop_timer_add(l, 1, chain_cb, ctx);
+    }
+}
+
+static void test_timer_added_from_callback(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    struct chain_ctx ctx = {
+        .count = 0,
+        .target = 10,
+    };
+
+    loop_timer_add(l, 1, chain_cb, &ctx);
+    loop_run(l);
+
+    assert(ctx.count == ctx.target);
+
+    loop_destroy(l);
+}
+
+/* ---------------------------------------------------------
+ * Stress tests
+ * --------------------------------------------------------- */
+
+static void test_many_timers(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    enum { N = 1000 };
+    int count = 0;
+
+    for (int i = 0; i < N; i++) {
+        loop_timer_add(l, (size_t)(i % 20), increment_cb, &count);
+    }
+
+    loop_run(l);
+
+    assert(count == N);
+
+    loop_destroy(l);
+}
+
+/* ---------------------------------------------------------
+ * Loop reuse
+ * --------------------------------------------------------- */
+
+static void test_reuse_loop(void) {
+    struct loop *l = loop_init();
+    assert(l != NULL);
+
+    int count = 0;
+
+    loop_timer_add(l, 1, increment_cb, &count);
+    loop_run(l);
+
+    assert(count == 1);
+
+    loop_timer_add(l, 1, increment_cb, &count);
+    loop_run(l);
+
+    assert(count == 2);
+
+    loop_destroy(l);
+}
+
 
 /* ---------------------------------------------------------
  * Main
@@ -489,7 +774,23 @@ int main(void) {
     RUN_TEST(test_randomized_order);
     RUN_TEST(test_randomized_interleaving);
 
-    printf("--------------------------------------------\n");
+
+    printf("\n" BOLD "Event Loop Test Suite" RESET "\n");
+    printf("------------------------------------------------\n");
+
+    RUN_TEST(test_init_destroy);
+    RUN_TEST(test_empty_loop);
+    RUN_TEST(test_single_timer);
+    RUN_TEST(test_timer_order);
+    RUN_TEST(test_same_deadline);
+    RUN_TEST(test_userdata);
+    RUN_TEST(test_zero_delay_timer);
+    RUN_TEST(test_timer_not_early);
+    RUN_TEST(test_timer_added_from_callback);
+    RUN_TEST(test_many_timers);
+    RUN_TEST(test_reuse_loop);
+
+    printf("------------------------------------------------\n");
     printf(GREEN BOLD "All %d tests passed!" RESET "\n\n", tests_passed);
 
     return 0;

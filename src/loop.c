@@ -1,30 +1,39 @@
 #include "loop.h"
 #include <assert.h>
+#include <err.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
 #include <time.h>
 #include <unistd.h>
 
 static bool less(const struct timer *a, const struct timer *b) {
-    if (a->deadline_ns < b->deadline_ns) {
+    if (a->deadline_ms < b->deadline_ms) {
         return true;
     } else {
         return false;
     }
 }
 
-void swap(struct timer **a, struct timer **b) {
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void swap(struct timer **a, struct timer **b) {
     void *tmp = *a;
     *a = *b;
     *b = tmp;
 }
 
 static void heapify_up(struct timers_heap *h, size_t index) {
-    while (index > 0 && h->items[(index - 1) / 2]->deadline_ns >
-                            h->items[index]->deadline_ns) {
+    while (index > 0 && h->items[(index - 1) / 2]->deadline_ms >
+                            h->items[index]->deadline_ms) {
         struct timer *tmp = h->items[(index - 1) / 2];
         h->items[(index - 1) / 2] = h->items[index];
         h->items[index] = tmp;
@@ -115,22 +124,16 @@ struct loop *loop_init(void) {
 }
 void loop_destroy(struct loop *l) {
     timers_heap_destroy(l->h);
+    free(l->h);
     free(l);
 }
 
-uint64_t monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-void loop_timer_add(struct loop *l, size_t expire_ns, timer_cb cb,
+void loop_timer_add(struct loop *l, size_t expire_ms, timer_cb cb,
                     void *userdata) {
     struct timer *t = malloc(sizeof(struct timer));
 
-    uint64_t now = monotonic_ns();
-    t->deadline_ns = expire_ns + now;
+    uint64_t now = monotonic_ms();
+    t->deadline_ms = expire_ms + now;
     t->handler = cb;
     t->userdata = userdata;
 
@@ -139,30 +142,27 @@ void loop_timer_add(struct loop *l, size_t expire_ns, timer_cb cb,
 
 void loop_run(struct loop *l) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
-    struct epoll_event events[1];
     assert(epfd >= 0);
+    struct epoll_event events[1];
 
     while (l->h->count > 0) {
         struct timer *t = timers_heap_peek(l->h);
-        uint64_t now = monotonic_ns();
+        uint64_t now = monotonic_ms();
 
-        if (now >= t->deadline_ns) {
+        if (now >= t->deadline_ms) {
             t = timers_heap_pop(l->h);
             t->handler(l, t->userdata);
+
+            free(t);
             continue;
         }
 
-        uint64_t remaining = t->deadline_ns - now;
+        int timeout = (int)(t->deadline_ms - now);
 
-        struct timespec timeout = {
-            .tv_sec = (time_t)(remaining / 1000000000ULL),
-            .tv_nsec = (long)(remaining % 1000000000ULL),
-        };
-
-        int rc = epoll_pwait2(epfd, events, 1, &timeout, NULL);
-
+        int rc = epoll_wait(epfd, events, 1, timeout);
         if (rc < 0 && errno != EINTR) {
-            break;
+            close(epfd);
+            err(EXIT_FAILURE, "epoll");
         }
     }
 

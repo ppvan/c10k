@@ -12,7 +12,7 @@ typedef void (*timer_cb)(struct loop *loop, void *userdata);
 
 // Timers.
 struct timer {
-    uint64_t deadline_ns;
+    uint64_t deadline_ms;
     timer_cb handler;
     void* userdata;
 };
