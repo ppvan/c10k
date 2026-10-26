@@ -1,5 +1,5 @@
 
-#include "loop/timers_heap.h"
+#include "event_loop.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -132,6 +132,7 @@ static void test_reuse(void) {
 }
 
 int main(void) {
+    // Timers heap test
     test_empty();
     test_single();
     test_sorted_order();

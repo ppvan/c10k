@@ -1,11 +1,6 @@
-
-#include "loop/timers_heap.h"
+#include "event_loop.h"
 #include <assert.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
-
 
 static void heapify_up(struct timers_heap *h, int index) {
     while (index > 0 && h->items[(index - 1) / 2]->deadline_ns >
