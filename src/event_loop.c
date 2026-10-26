@@ -1,8 +1,24 @@
 #include "event_loop.h"
 #include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdlib.h>
 
-static void heapify_up(struct timers_heap *h, int index) {
+static bool less(const struct timer *a, const struct timer *b) {
+    if (a->deadline_ns < b->deadline_ns) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void swap(struct timer **a, struct timer **b) {
+    void *tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+static void heapify_up(struct timers_heap *h, size_t index) {
     while (index > 0 && h->items[(index - 1) / 2]->deadline_ns >
                             h->items[index]->deadline_ns) {
         struct timer *tmp = h->items[(index - 1) / 2];
@@ -13,28 +29,20 @@ static void heapify_up(struct timers_heap *h, int index) {
     }
 }
 
-static void heapify_down(struct timers_heap *h, int index) {
-    int smallest = index;
-    int left = 2 * index + 1;
-    int right = 2 * index + 2;
+static void heapify_down(struct timers_heap *h, size_t index) {
+    size_t smallest = index;
+    size_t left = 2 * index + 1;
+    size_t right = 2 * index + 2;
 
-    // Check if left child is smaller than the current smallest
-    if (left < h->count &&
-        h->items[left]->deadline_ns < h->items[smallest]->deadline_ns) {
+    if (left < h->count && less(h->items[left], h->items[smallest])) {
         smallest = left;
     }
-    // Check if right child is smaller than the current smallest
-    if (right < h->count &&
-        h->items[right]->deadline_ns < h->items[smallest]->deadline_ns) {
+    if (right < h->count && less(h->items[right], h->items[smallest])) {
         smallest = right;
     }
 
-    // If the smallest is not the parent, swap and recurse down
     if (smallest != index) {
-        struct timer *tmp = h->items[index];
-        h->items[index] = h->items[smallest];
-        h->items[smallest] = tmp;
-
+        swap(&h->items[index], &h->items[smallest]);
         heapify_down(h, smallest);
     }
 }
