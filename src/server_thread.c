@@ -241,7 +241,7 @@ static bool accept_error_is_fatal(int e) {
     }
 }
 
-static void accept_loop(int listen_fd) {
+static void acceptloop(int listen_fd) {
     int peer_fd;
     while (atomic_load_explicit(&running, memory_order_relaxed)) {
         pthread_t t;
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
     pthread_t t = start_telemetry();
 
     printf("Listening to: %s:%u.\n", address, port);
-    accept_loop(listen_fd);
+    acceptloop(listen_fd);
 
     //
     pthread_join(t, NULL);
