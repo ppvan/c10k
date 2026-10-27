@@ -10,8 +10,21 @@
 #include <time.h>
 #include <unistd.h>
 
+struct timer {
+    uint64_t expiration_ms;
+    timer_cb handler;
+    void *userdata;
+};
+
+struct loop {
+
+    struct timer **timers;
+    size_t timers_count;
+    size_t timers_cap;
+};
+
 static bool less(const struct timer *a, const struct timer *b) {
-    if (a->deadline_ms < b->deadline_ms) {
+    if (a->expiration_ms < b->expiration_ms) {
         return true;
     } else {
         return false;
@@ -31,113 +44,96 @@ static void swap(struct timer **a, struct timer **b) {
     *b = tmp;
 }
 
-static void heapify_up(struct timers_heap *h, size_t index) {
-    while (index > 0 && h->items[(index - 1) / 2]->deadline_ms >
-                            h->items[index]->deadline_ms) {
-        struct timer *tmp = h->items[(index - 1) / 2];
-        h->items[(index - 1) / 2] = h->items[index];
-        h->items[index] = tmp;
+static void heapify_up(struct loop *l, size_t index) {
+    while (index > 0 && less(l->timers[index], l->timers[(index - 1) / 2])) {
+        struct timer *tmp = l->timers[(index - 1) / 2];
+        l->timers[(index - 1) / 2] = l->timers[index];
+        l->timers[index] = tmp;
 
         index = (index - 1) / 2;
     }
 }
 
-static void heapify_down(struct timers_heap *h, size_t index) {
+static void heapify_down(struct loop *l, size_t index) {
     size_t smallest = index;
     size_t left = 2 * index + 1;
     size_t right = 2 * index + 2;
 
-    if (left < h->count && less(h->items[left], h->items[smallest])) {
+    if (left < l->timers_count && less(l->timers[left], l->timers[smallest])) {
         smallest = left;
     }
-    if (right < h->count && less(h->items[right], h->items[smallest])) {
+
+    if (right < l->timers_count && less(l->timers[right], l->timers[smallest])) {
         smallest = right;
     }
 
     if (smallest != index) {
-        swap(&h->items[index], &h->items[smallest]);
-        heapify_down(h, smallest);
+        swap(&l->timers[index], &l->timers[smallest]);
+        heapify_down(l, smallest);
     }
 }
 
-void timers_heap_init(struct timers_heap *h) {
-    h->cap = 256;
-    h->count = 0;
-    h->items = malloc((size_t)h->cap * sizeof(struct timer *));
-}
+static void timers_heap_push(struct loop *l, struct timer *t) {
+    if (l->timers_count >= l->timers_cap) {
+        l->timers_cap *= 2;
+        l->timers = realloc(l->timers, (size_t)l->timers_cap * sizeof(struct timer *));
 
-void timers_heap_destroy(struct timers_heap *h) {
-    // for (size_t i = 0; i < h->count; i++) {
-    //     free(h->items[i]);
-    //     h->items[i] = NULL;
-    // }
-
-    free(h->items);
-    h->items = NULL;
-}
-
-void timers_heap_push(struct timers_heap *h, struct timer *t) {
-    if (h->count >= h->cap) {
-        h->cap *= 2;
-        h->items = realloc(h->items, (size_t)h->cap * sizeof(struct timer *));
-
-        assert(h->items && "out of memory, buy more ram");
+        assert(l->timers && "out of memory, buy more ram");
     }
 
-    h->items[h->count++] = t;
-    heapify_up(h, h->count - 1);
+    l->timers[l->timers_count++] = t;
+    heapify_up(l, l->timers_count - 1);
 }
 
-struct timer *timers_heap_peek(const struct timers_heap *h) {
-    if (h->count == 0) {
+static struct timer *timers_heap_peek(const struct loop *l) {
+    if (l->timers_count == 0) {
         return NULL;
     }
-    return h->items[0];
+    return l->timers[0];
 }
 
-struct timer *timers_heap_pop(struct timers_heap *h) {
-    if (h->count <= 0) {
+static struct timer *timers_heap_pop(struct loop *l) {
+    if (l->timers_count <= 0) {
         return NULL;
     }
 
-    struct timer *root = h->items[0];
+    struct timer *root = l->timers[0];
 
-    h->items[0] = h->items[h->count - 1];
-    h->count--;
-    if (h->count > 0) {
-        heapify_down(h, 0);
+    l->timers[0] = l->timers[l->timers_count - 1];
+    l->timers_count--;
+    if (l->timers_count > 0) {
+        heapify_down(l, 0);
     }
 
     return root;
 }
 
-struct loop {
-    struct timers_heap *h;
-};
-
-struct loop *loop_init(void) {
+struct loop *loop_new(void) {
     struct loop *l = malloc(sizeof(struct loop));
-    l->h = malloc(sizeof(struct timers_heap));
-    timers_heap_init(l->h);
+    l->timers_cap = 256;
+    l->timers_count = 0;
+    l->timers = malloc((size_t)l->timers_cap * sizeof(struct timer *));
 
     return l;
 }
+
 void loop_destroy(struct loop *l) {
-    timers_heap_destroy(l->h);
-    free(l->h);
+    free(l->timers);
     free(l);
 }
 
-void loop_timer_add(struct loop *l, size_t expire_ms, timer_cb cb,
-                    void *userdata) {
+struct timer* loop_timer_add(struct loop *l, size_t expire_ms, timer_cb cb,
+                      void *userdata) {
     struct timer *t = malloc(sizeof(struct timer));
 
     uint64_t now = monotonic_ms();
-    t->deadline_ms = expire_ms + now;
+    t->expiration_ms = expire_ms + now;
     t->handler = cb;
     t->userdata = userdata;
 
-    timers_heap_push(l->h, t);
+    timers_heap_push(l, t);
+
+    return t;
 }
 
 void loop_run(struct loop *l) {
@@ -145,19 +141,19 @@ void loop_run(struct loop *l) {
     assert(epfd >= 0);
     struct epoll_event events[1];
 
-    while (l->h->count > 0) {
-        struct timer *t = timers_heap_peek(l->h);
+    while (l->timers_count > 0) {
+        struct timer *t = timers_heap_peek(l);
         uint64_t now = monotonic_ms();
 
-        if (now >= t->deadline_ms) {
-            t = timers_heap_pop(l->h);
+        if (now >= t->expiration_ms) {
+            t = timers_heap_pop(l);
             t->handler(l, t->userdata);
 
             free(t);
             continue;
         }
 
-        int timeout = (int)(t->deadline_ms - now);
+        int timeout = (int)(t->expiration_ms - now);
 
         int rc = epoll_wait(epfd, events, 1, timeout);
         if (rc < 0 && errno != EINTR) {

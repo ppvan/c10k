@@ -11,7 +11,7 @@ void on_time(struct loop *l, void *userdata) {
 }
 
 int main(void) {
-    struct loop *l = loop_init();
+    struct loop *l = loop_new();
     loop_timer_add(l, 5000, on_time, (void *)(intptr_t)5);
     loop_timer_add(l, 1000, on_time, (void *)(intptr_t)1);
     loop_timer_add(l, 3000, on_time, (void *)(intptr_t)3);
