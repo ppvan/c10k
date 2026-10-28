@@ -1,25 +1,34 @@
+// test.c
 #include "loop.h"
-#include <stddef.h>
-#include <stdint.h>
+#include <assert.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <sys/epoll.h>
+#include <unistd.h>
 
-void on_time(struct loop *l, void *userdata) {
-    (void)l;
-    int num = (int)(intptr_t)userdata;
-    printf("Hello to number: %d\n", num);
-}
+static int hits;
+static void on_read(struct loop *l, int fd, uint32_t ev, void *ud) {
+    (void)ev;
+    (void)ud;
 
-void on_cancel(struct loop *l, void *userdata) {
-    uint64_t id = (uint64_t)(intptr_t)userdata;
-    loop_timer_cancel(l, id);
+    char b[8];
+    (void)read(fd, b, sizeof b);
+    hits++;
+    loop_io_remove(l, fd);
+    close(fd);
+    loop_stop(l);
 }
 
 int main(void) {
     struct loop *l = loop_new();
-    uint64_t id = loop_timer_add(l, 5000, on_time, (void *)(intptr_t)5);
-    loop_timer_add(l, 1000, on_time, (void *)(intptr_t)1);
-    loop_timer_add(l, 3000, on_cancel, (void *)(intptr_t)id);
-    loop_timer_add(l, 6000, on_time, (void *)(intptr_t)10);
+    int p[2];
+    assert(pipe(p) == 0);
+    int big = dup2(p[0], 1000);            // forces io_by_fd growth past 256
+    assert(big == 1000);
+    assert(loop_io_add(l, on_read, big, EPOLLIN, NULL));
+    assert(write(p[1], "x", 1) == 1);
     loop_run(l);
+    assert(hits == 1);
     loop_destroy(l);
+    puts("ok");
 }
