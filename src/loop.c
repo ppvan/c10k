@@ -271,14 +271,21 @@ void loop_run(struct loop *l) {
     struct epoll_event events[1];
 
     while (l->timers_count > 0) {
-        struct timer *t = timers_heap_peek(l);
         uint64_t now = monotonic_ms();
+
+        struct timer *t = timers_heap_peek(l);
         if (now >= t->expiration_ms) {
+            // Order matters: the callback may add timers or change the loop, so
+            // the expired timer must be fully removed before it runs.
+            //   1. Pop it from the heap.
+            //   2. Release its slot (invalidates the timer id).
+            //   3. Copy handler/userdata, then free the timer.
+            //   4. Call the handler last.
             t = timers_heap_pop(l);
+            slot_release(l, t);
+
             timer_cb cb = t->handler;
             void *ud = t->userdata;
-
-            slot_release(l, t);
             free(t);
 
             cb(l, ud);
