@@ -1,6 +1,7 @@
-#ifndef LOOOP_H
-#define LOOOP_H
+#ifndef LOOP_H
+#define LOOP_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -13,7 +14,8 @@ struct loop *loop_new(void);
 void loop_destroy(struct loop *l);
 void loop_run(struct loop *l);
 
-struct timer* loop_timer_add(struct loop *l, size_t expire_ns, timer_cb cb, void* userdata);
-void loop_timer_cancel(struct loop *l, size_t id);
+uint64_t loop_timer_add(struct loop *l, uint64_t delay_ms, timer_cb cb,
+                        void *userdata);
+bool loop_timer_cancel(struct loop *l, uint64_t id);
 
 #endif

@@ -3,18 +3,23 @@
 #include <stdint.h>
 #include <stdio.h>
 
-
 void on_time(struct loop *l, void *userdata) {
     (void)l;
     int num = (int)(intptr_t)userdata;
     printf("Hello to number: %d\n", num);
 }
 
+void on_cancel(struct loop *l, void *userdata) {
+    uint64_t id = (uint64_t)(intptr_t)userdata;
+    loop_timer_cancel(l, id);
+}
+
 int main(void) {
     struct loop *l = loop_new();
-    loop_timer_add(l, 5000, on_time, (void *)(intptr_t)5);
+    uint64_t id = loop_timer_add(l, 5000, on_time, (void *)(intptr_t)5);
     loop_timer_add(l, 1000, on_time, (void *)(intptr_t)1);
-    loop_timer_add(l, 3000, on_time, (void *)(intptr_t)3);
+    loop_timer_add(l, 3000, on_cancel, (void *)(intptr_t)id);
+    loop_timer_add(l, 6000, on_time, (void *)(intptr_t)10);
     loop_run(l);
     loop_destroy(l);
 }
