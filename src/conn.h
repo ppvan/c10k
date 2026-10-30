@@ -21,7 +21,7 @@ struct listener *listener_new(struct loop *l,
                               int backlog,
                               listener_accept_cb on_accept,
                               void *ud);
-void conn_start(struct conn *, const struct conn_ops *, void *ud);
+void conn_start(struct conn *, const struct conn_ops, void *ud);
 void conn_abort(struct conn *);
 void listener_close(struct listener *);
 

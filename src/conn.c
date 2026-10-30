@@ -3,6 +3,8 @@
 #include <arpa/inet.h>
 #include <err.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -11,8 +13,14 @@
 
 struct conn {
     struct loop *loop;
+    struct conn_ops ops;
 
     int fd;
+    uint32_t events;
+    char buf[1024];
+    size_t offset;
+
+    void *user_data;
 };
 
 struct listener {
@@ -28,10 +36,47 @@ struct conn_ops {
     void (*on_close)(struct conn *, int err, void *ud);
 };
 
+static void on_conn_read(struct loop *l, int fd, uint32_t events, void *ud) {
+    (void)fd;
+    (void)l;
+
+    struct conn *c = (struct conn *)ud;
+    if (events & (EPOLLERR | EPOLLHUP)) {
+        conn_abort(c);
+        return;
+    }
+
+    if (events & EPOLLIN) {
+        ssize_t n = recv(c->fd, c->buf, sizeof c->buf, 0);
+        if (n == 0) {
+            conn_abort(c);
+            return;
+        }
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                conn_abort(c);
+            }
+            return;
+        }
+
+        size_t len = (size_t)n;
+        size_t consumed = c->ops.on_read(c, c->buf, len, c->user_data);
+
+        size_t offset = len - consumed;
+        memcpy(c->buf, c->buf + consumed, offset);
+
+        // Switch to write mode
+        if (!loop_io_mod(c->loop, c->fd, EPOLLOUT)) {
+            conn_abort(c);
+            return;
+        }
+    }
+}
+
+
 typedef void (*listener_accept_cb)(struct listener *, struct conn *, void *ud);
 
-static void on_accept_adapter(struct loop *l, int fd, uint32_t events,
-                              void *ud) {
+static void on_accept_adapter(struct loop *l, int fd, uint32_t events, void *ud) {
 
     (void)events;
     (void)fd;
@@ -52,13 +97,17 @@ static void on_accept_adapter(struct loop *l, int fd, uint32_t events,
 
     struct conn *c = MALLOC(sizeof(struct conn));
     c->fd = peer_fd;
-    c->loop = lis->loop;
+    c->loop = l;
 
     lis->handler(lis, c, lis->user_data);
 }
 
-struct listener *listener_new(struct loop* l, const char *address, uint16_t port, int backlog,
-                              listener_accept_cb on_accept, void *ud) {
+struct listener *listener_new(struct loop *l,
+                              const char *address,
+                              uint16_t port,
+                              int backlog,
+                              listener_accept_cb on_accept,
+                              void *ud) {
 
     struct sockaddr_storage addr;
     socklen_t addrlen;
@@ -80,8 +129,7 @@ struct listener *listener_new(struct loop* l, const char *address, uint16_t port
         return NULL;
     }
 
-    int fd =
-        socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         return NULL;
     }
@@ -124,5 +172,15 @@ void listener_close(struct listener *lis) {
     free(lis);
 }
 
-void conn_start(struct conn *, const struct conn_ops *, void *ud);
-void conn_abort(struct conn *);
+void conn_start(struct conn *c, const struct conn_ops ops, void *ud) {
+    c->ops = ops;
+    c->user_data = ud;
+
+    loop_io_add(c->loop, on_conn_read, c->fd, EPOLLIN, c);
+}
+
+void conn_abort(struct conn *c) {
+    c->ops.on_close(c, errno, c->user_data);
+    loop_io_remove(c->loop, c->fd);
+    close(c->fd);
+}
