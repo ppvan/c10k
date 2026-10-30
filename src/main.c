@@ -12,7 +12,7 @@ size_t on_read(struct conn *c, const void *buf, size_t len, void *ud) {
     (void)buf;
 
     printf("len = %lu \n", len);
-    conn_abort(c);
+    conn_abort(c, 0);
 
     return len;
 }

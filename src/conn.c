@@ -20,7 +20,7 @@ struct conn {
     char buf[1024];
     size_t offset;
 
-    void *user_data;
+    void *conn_ctx;
 };
 
 struct listener {
@@ -28,7 +28,7 @@ struct listener {
     struct loop *loop;
 
     listener_accept_cb handler;
-    void *user_data;
+    void *listener_ctx;
 };
 
 struct conn_ops {
@@ -41,38 +41,28 @@ static void on_conn_read(struct loop *l, int fd, uint32_t events, void *ud) {
     (void)l;
 
     struct conn *c = (struct conn *)ud;
-    if (events & (EPOLLERR | EPOLLHUP)) {
-        conn_abort(c);
+    if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        conn_abort(c, ECONNRESET);
         return;
     }
 
     if (events & EPOLLIN) {
         ssize_t n = recv(c->fd, c->buf, sizeof c->buf, 0);
         if (n == 0) {
-            conn_abort(c);
+            conn_abort(c, ECONNRESET);
             return;
         }
         if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                conn_abort(c);
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                conn_abort(c, errno);
             }
             return;
         }
 
         size_t len = (size_t)n;
-        size_t consumed = c->ops.on_read(c, c->buf, len, c->user_data);
-
-        size_t offset = len - consumed;
-        memcpy(c->buf, c->buf + consumed, offset);
-
-        // Switch to write mode
-        if (!loop_io_mod(c->loop, c->fd, EPOLLOUT)) {
-            conn_abort(c);
-            return;
-        }
+        c->ops.on_read(c, c->buf, len, c->conn_ctx);
     }
 }
-
 
 typedef void (*listener_accept_cb)(struct listener *, struct conn *, void *ud);
 
@@ -85,9 +75,9 @@ static void on_accept_adapter(struct loop *l, int fd, uint32_t events, void *ud)
     struct listener *lis = (struct listener *)(ud);
     int peer_fd = accept4(lis->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (peer_fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
             // No connections are ready right now.
-            // Simply return to your event loop or do other work.
+            // Simply return to event loop or do other work.
             return;
         } else {
             err(EXIT_FAILURE, "can't accept any more");
@@ -99,7 +89,7 @@ static void on_accept_adapter(struct loop *l, int fd, uint32_t events, void *ud)
     c->fd = peer_fd;
     c->loop = l;
 
-    lis->handler(lis, c, lis->user_data);
+    lis->handler(lis, c, lis->listener_ctx);
 }
 
 struct listener *listener_new(struct loop *l,
@@ -153,7 +143,7 @@ struct listener *listener_new(struct loop *l,
         .fd = fd,
         .handler = on_accept,
         .loop = l,
-        .user_data = ud,
+        .listener_ctx = ud,
     };
 
     bool ok = loop_io_add(lis->loop, on_accept_adapter, lis->fd, EPOLLIN, lis);
@@ -174,13 +164,21 @@ void listener_close(struct listener *lis) {
 
 void conn_start(struct conn *c, const struct conn_ops ops, void *ud) {
     c->ops = ops;
-    c->user_data = ud;
+    c->conn_ctx = ud;
 
-    loop_io_add(c->loop, on_conn_read, c->fd, EPOLLIN, c);
+    bool ok = loop_io_add(c->loop, on_conn_read, c->fd, EPOLLIN, c);
+    if (!ok) {
+        c->ops.on_close(c, errno, c->conn_ctx);
+    }
 }
 
-void conn_abort(struct conn *c) {
-    c->ops.on_close(c, errno, c->user_data);
+void conn_abort(struct conn *c, int err) {
     loop_io_remove(c->loop, c->fd);
     close(c->fd);
+
+    void (*handler)(struct conn *, int err, void *ud) = c->ops.on_close;
+    void *ctx = c->conn_ctx;
+    handler(c, err, ctx);
+
+    free(c);
 }
