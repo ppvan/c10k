@@ -13,13 +13,9 @@
 
 struct conn {
     struct loop *loop;
-    struct conn_ops ops;
-
     int fd;
-    uint32_t events;
-    char buf[1024];
-    size_t offset;
 
+    struct conn_ops ops;
     void *conn_ctx;
 };
 
@@ -29,11 +25,6 @@ struct listener {
 
     listener_accept_cb handler;
     void *listener_ctx;
-};
-
-struct conn_ops {
-    size_t (*on_read)(struct conn *, const void *buf, size_t len, void *ud);
-    void (*on_close)(struct conn *, int err, void *ud);
 };
 
 static void on_conn_read(struct loop *l, int fd, uint32_t events, void *ud) {
@@ -47,20 +38,22 @@ static void on_conn_read(struct loop *l, int fd, uint32_t events, void *ud) {
     }
 
     if (events & EPOLLIN) {
-        ssize_t n = recv(c->fd, c->buf, sizeof c->buf, 0);
+        char buf[1024];
+        ssize_t n = recv(c->fd, buf, sizeof buf, 0);
         if (n == 0) {
-            conn_abort(c, ECONNRESET);
+            conn_abort(c, 0);
             return;
         }
         if (n < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                conn_abort(c, errno);
+                int err = errno;
+                conn_abort(c, err);
             }
             return;
         }
 
         size_t len = (size_t)n;
-        c->ops.on_read(c, c->buf, len, c->conn_ctx);
+        c->ops.on_read(c, buf, len, c->conn_ctx);
     }
 }
 
