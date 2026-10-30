@@ -1,5 +1,5 @@
 CC     = /usr/bin/clang
-CFLAGS = -std=c17 -g3 -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
+CFLAGS = -std=c23 -g3 -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
          -Wformat=2 -Wnull-dereference -Wimplicit-fallthrough -pthread -D_GNU_SOURCE
 SAN    = -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 
@@ -12,7 +12,9 @@ test: debug
 
 debug:
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/loop_test.out src/loop_test.c src/loop.c
-	$(CC) $(CFLAGS) -O0 $(SAN) -o build/main.out src/main.c src/loop.c
+	$(CC) $(CFLAGS) -O0 $(SAN) -o build/main.out src/main.c src/loop.c src/conn.c
+	$(CC) $(CFLAGS) -O0 $(SAN) -o build/client.out src/client.c
+	$(CC) $(CFLAGS) -O0 $(SAN) -o build/echo.out src/echo.c src/loop.c
 
 tsan:
 	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o build/loop_test.out src/loop_test.c src/loop.c

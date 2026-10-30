@@ -11,17 +11,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static void *must_alloc(void *p, const char *file, int line) {
-    if (p == NULL) {
-        errx(EXIT_FAILURE, "%s:%d: out of memory", file, line);
-    }
-    return p;
-}
-
-#define MALLOC(size) must_alloc(malloc(size), __FILE__, __LINE__)
-#define REALLOC(ptr, size)                                                     \
-    must_alloc(realloc((ptr), (size)), __FILE__, __LINE__)
-
 struct timer {
     uint64_t expiration_ms;
     timer_cb handler;
@@ -449,3 +438,10 @@ bool loop_io_mod(struct loop *l, int fd, uint32_t events) {
     return true;
 }
 void loop_stop(struct loop *l) { l->stopped = true; }
+
+void *must_alloc(void *p, const char *file, int line) {
+    if (p == NULL) {
+        errx(EXIT_FAILURE, "%s:%d: out of memory", file, line);
+    }
+    return p;
+}
