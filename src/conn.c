@@ -16,6 +16,8 @@
 struct conn {
     struct loop *loop;
     int fd;
+    uint32_t events;
+    bool started;   /* registered with the loop */
 
     char *write_buf;
     size_t w_queued;
@@ -23,6 +25,11 @@ struct conn {
     char *read_buf;
     size_t r_queued;
 
+    bool closing;
+    int close_err;
+    uint64_t reap_id;
+
+    uint64_t deliver_id;
     struct conn_ops ops;
     void *conn_ctx;
 };
@@ -35,91 +42,144 @@ struct listener {
     void *listener_ctx;
 };
 
+static bool sync_events(struct conn *c) {
+    if (!c->started)
+        return true;
+    return loop_io_mod(c->loop, c->fd, c->events);
+}
+
+static void deliver(struct conn *c) {
+    if (c->closing || c->r_queued == 0 || !(c->events & EPOLLIN))
+        return;
+
+    size_t n = c->r_queued;
+    size_t consumed = c->ops.on_read(c, c->read_buf, n, c->conn_ctx);
+    if (c->closing)
+        return;
+
+    if (consumed > n) {
+        conn_abort(c, EPROTO);
+        return;
+    }
+
+    memmove(c->read_buf, c->read_buf + consumed, n - consumed);
+    c->r_queued = n - consumed;
+}
+
+static void deliver_cb(struct loop *, void *ud) {
+    struct conn *c = ud;
+    c->deliver_id = 0;
+    deliver(c);
+}
+
+static void schedule_deliver(struct conn *c) {
+    if (c->closing || c->deliver_id || c->r_queued == 0)
+        return;
+    c->deliver_id = loop_timer_add(c->loop, 0, deliver_cb, c);
+}
+
+static void handle_readable(struct conn *c) {
+    if (c->r_queued == BUF_SIZE) {
+        deliver(c);
+        if (c->closing)
+            return;
+        if (c->r_queued == BUF_SIZE) {
+            // Buffer still full. If the app paused inside on_read this is
+            // legitimate backpressure; otherwise it broke the contract.
+            // Either way never recv() with length 0 (it looks like EOF).
+            if (c->events & EPOLLIN)
+                conn_abort(c, EMSGSIZE);
+            return;
+        }
+    }
+
+    ssize_t n = recv(c->fd, c->read_buf + c->r_queued, BUF_SIZE - c->r_queued, 0);
+    if (n == 0) {
+        conn_abort(c, 0);
+        return;
+    }
+    if (n < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            int err = errno;
+            conn_abort(c, err);
+        }
+        return;
+    }
+
+    c->r_queued += (size_t)n;
+    schedule_deliver(c);
+}
+
+static void handle_writable(struct conn *c) {
+    if (c->w_queued == 0) {
+        c->events &= ~EPOLLOUT;
+        sync_events(c);
+        return;
+    }
+
+    ssize_t n = send(c->fd, c->write_buf, c->w_queued, MSG_NOSIGNAL);
+    if (n < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            int err = errno;
+            conn_abort(c, err);
+        }
+        return;
+    }
+
+    size_t w = (size_t)n;
+    size_t pending = c->w_queued - w;
+    memmove(c->write_buf, c->write_buf + w, pending);
+    c->w_queued = pending;
+
+    if (c->w_queued == 0) {
+        c->events &= ~EPOLLOUT;
+        if (c->ops.on_drain != nullptr) {
+            c->ops.on_drain(c, c->conn_ctx);
+        }
+        if (c->closing)
+            return;
+        sync_events(c);
+    }
+}
+
 static void io_signal_callback(struct loop *, int, uint32_t events, void *ud) {
     struct conn *c = (struct conn *)ud;
+    if (c->closing)
+        return; // stale event from the same epoll batch
+
     if (events & (EPOLLERR | EPOLLHUP)) {
         conn_abort(c, ECONNRESET);
         return;
     }
 
     if (events & EPOLLIN) {
-        ssize_t n = recv(c->fd, c->read_buf + c->r_queued, BUF_SIZE - c->r_queued, 0);
-        if (n == 0) {
-            conn_abort(c, 0);
+        handle_readable(c);
+        if (c->closing)
             return;
-        }
-        if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                int err = errno;
-                conn_abort(c, err);
-            }
-            return;
-        }
-
-        // socket: 1 2 3 4 5
-        // app consumed: 123
-        // queued: 4 5
-        size_t total = c->r_queued + (size_t)n;
-        size_t consumed = c->ops.on_read(c, c->read_buf, total, c->conn_ctx);
-        memmove(c->read_buf, c->read_buf + consumed, total - consumed);
-        c->r_queued = total - consumed;
     }
 
     if (events & EPOLLOUT) {
-
-        ssize_t n = send(c->fd, c->write_buf, c->w_queued, 0);
-        if (n == 0) {
-            conn_abort(c, 0);
-            return;
-        }
-        if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                int err = errno;
-                conn_abort(c, err);
-            }
-            return;
-        }
-
-        // 1 2 3 4 5
-        // write 1 2 3 -> pending = 2
-        // 4 5
-        size_t w = (size_t)n;
-        size_t pending = c->w_queued - w;
-        memmove(c->write_buf, c->write_buf + w, pending);
-        c->w_queued = pending;
-
-        if (c->w_queued == 0) {
-            loop_io_mod(c->loop, c->fd, EPOLLIN);
-        }
+        handle_writable(c);
     }
 }
 
-static void new_conn_imcoming(struct loop *l, int, uint32_t events, void *ud) {
-
-    if (events != EPOLLIN) {
-        err(EXIT_FAILURE, "not implemented");
-    }
-
+static void new_conn_incoming(struct loop *l, int, uint32_t, void *ud) {
     struct listener *lis = (struct listener *)(ud);
     int peer_fd = accept4(lis->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (peer_fd < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-            // No connections are ready right now.
-            // Simply return to event loop or do other work.
-            return;
-        } else {
-            err(EXIT_FAILURE, "can't accept any more");
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
+            // Nothing ready, or the peer gave up before we accepted.
             return;
         }
+        err(EXIT_FAILURE, "can't accept any more");
     }
 
     struct conn *c = MALLOC(sizeof(struct conn));
+    *c = (struct conn){};
     c->fd = peer_fd;
     c->loop = l;
     c->read_buf = MALLOC(BUF_SIZE * sizeof(char));
     c->write_buf = MALLOC(BUF_SIZE * sizeof(char));
-    c->w_queued = 0;
-    c->r_queued = 0;
 
     lis->handler(lis, c, lis->listener_ctx);
 }
@@ -178,7 +238,7 @@ struct listener *listener_new(struct loop *l,
         .listener_ctx = ud,
     };
 
-    bool ok = loop_io_add(lis->loop, new_conn_imcoming, lis->fd, EPOLLIN, lis);
+    bool ok = loop_io_add(lis->loop, new_conn_incoming, lis->fd, EPOLLIN, lis);
     if (!ok) {
         close(lis->fd);
         free(lis);
@@ -195,43 +255,97 @@ void listener_close(struct listener *lis) {
 }
 
 void conn_start(struct conn *c, const struct conn_ops ops, void *ud) {
+    if (c->closing || c->started)
+        return;
+
     c->ops = ops;
     c->conn_ctx = ud;
+    c->events |= EPOLLIN;
 
-    bool ok = loop_io_add(c->loop, io_signal_callback, c->fd, EPOLLIN, c);
+    bool ok = loop_io_add(c->loop, io_signal_callback, c->fd, c->events, c);
     if (!ok) {
         int err = errno;
         conn_abort(c, err);
+        return;
     }
+    c->started = true;
 }
 
 ssize_t conn_write(struct conn *c, const char *buf, size_t len) {
+    if (c->closing)
+        return -EPIPE;
 
-    if (c->w_queued + len > BUF_SIZE) {
-        err(EXIT_FAILURE, "not implemented");
-    }
+    if (len == 0)
+        return 0;
 
-    size_t queued = c->w_queued;
+    if (len > BUF_SIZE)
+        return -EMSGSIZE; // can never fit, retrying on on_drain would hang
+
+    if (c->w_queued + len > BUF_SIZE)
+        return -ENOBUFS;
+
+    size_t old_queued = c->w_queued;
+    uint32_t old_events = c->events;
+
+    memcpy(c->write_buf + old_queued, buf, len);
     c->w_queued += len;
-    memcpy(c->write_buf + queued, buf, len);
+    c->events |= EPOLLOUT;
 
-    bool ok = loop_io_mod(c->loop, c->fd, EPOLLIN | EPOLLOUT);
-    if (!ok) {
-        err(EXIT_FAILURE, "not implemented");
+    if (!sync_events(c)) {
+        c->w_queued = old_queued; // nothing queued on failure
+        c->events = old_events;
+        return -EPIPE;
     }
 
-    return (ssize_t)len;
+    return 0;
 }
 
-void conn_abort(struct conn *c, int err) {
-    loop_io_remove(c->loop, c->fd);
-    close(c->fd);
+static void reap_cb(struct loop *, void *ud) {
+    struct conn *c = (struct conn *)ud;
 
-    void (*handler)(struct conn *, int err, void *ud) = c->ops.on_close;
-    void *ctx = c->conn_ctx;
-    handler(c, err, ctx);
+    if (c->ops.on_close != nullptr) {
+        c->ops.on_close(c, c->close_err, c->conn_ctx);
+    }
 
     free(c->write_buf);
     free(c->read_buf);
     free(c);
+}
+
+void conn_abort(struct conn *c, int err) {
+    if (c->closing)
+        return;
+    c->closing = true;
+    c->close_err = err;
+
+    if (c->deliver_id) {
+        loop_timer_cancel(c->loop, c->deliver_id);
+        c->deliver_id = 0;
+    }
+
+    if (c->started)
+        loop_io_remove(c->loop, c->fd);
+    close(c->fd);
+    c->fd = -1;
+
+    c->reap_id = loop_timer_add(c->loop, 0, reap_cb, c);
+}
+
+void conn_read_pause(struct conn *c) {
+    if (c->closing)
+        return;
+
+    c->events &= ~EPOLLIN;
+    sync_events(c);
+}
+
+void conn_read_resume(struct conn *c) {
+    if (c->closing)
+        return;
+
+    c->events |= EPOLLIN;
+    sync_events(c);
+
+    // The kernel can't see read_buf, so re-deliver it ourselves.
+    schedule_deliver(c);
 }
