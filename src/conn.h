@@ -4,7 +4,6 @@
 #include "loop.h"
 #include <stddef.h>
 #include <stdint.h>
-
 struct conn;
 struct listener;
 
@@ -23,6 +22,7 @@ struct listener *listener_new(struct loop *l,
                               void *ud);
 void conn_start(struct conn *, const struct conn_ops, void *ud);
 void conn_abort(struct conn *, int err);
+ssize_t conn_write(struct conn *, const char* buf, size_t len);
 void listener_close(struct listener *);
 
 #endif
