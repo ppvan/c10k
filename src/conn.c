@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -11,7 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BUF_SIZE 1024
+#define BUF_SIZE 1048576
 
 struct conn {
     struct loop *loop;
@@ -38,12 +39,14 @@ struct conn {
 
 struct listener {
     int fd;
+    int spare_fd; /* parked fd, see shed_one() */
     struct loop *loop;
 
     listener_accept_cb handler;
     void *listener_ctx;
 };
 
+/* ---------- helpers ---------- */
 
 static struct conn *conn_alloc(struct loop *l, int fd) {
     struct conn *c = MALLOC(sizeof(struct conn));
@@ -55,6 +58,7 @@ static struct conn *conn_alloc(struct loop *l, int fd) {
     return c;
 }
 
+/* Numeric IPv4 or IPv6 only. */
 static bool parse_addr(const char *ip,
                        uint16_t port,
                        struct sockaddr_storage *ss,
@@ -178,6 +182,8 @@ static void handle_writable(struct conn *c) {
     }
 }
 
+/* The socket became writable (or failed) while connecting. The real outcome is
+ * in SO_ERROR: EPOLLERR/EPOLLHUP alone only say "it failed", not why. */
 static void handle_connect(struct conn *c, uint32_t events) {
     if (!(events & (EPOLLOUT | EPOLLERR | EPOLLHUP)))
         return;
@@ -200,6 +206,9 @@ static void handle_connect(struct conn *c, uint32_t events) {
         c->connect_timer = 0;
     }
 
+    // Start reading. Keep EPOLLOUT only if conn_write() queued data before the
+    // handshake finished. Set this BEFORE on_connect so that a conn_read_pause
+    // or conn_write inside on_connect builds on the final state.
     c->events = EPOLLIN | (c->w_queued > 0 ? EPOLLOUT : 0);
     if (!sync_events(c)) {
         int e = errno;
@@ -244,19 +253,53 @@ static void io_signal_callback(struct loop *, int, uint32_t events, void *ud) {
 }
 
 
+/* Out of file descriptors. With level-triggered epoll the listener would fire
+ * again immediately (100% CPU) and the waiting client would just hang in the
+ * backlog. Instead: give back the spare fd, accept the connection so it leaves
+ * the queue, close it (the client sees the close right away), take the spare
+ * fd back. Connections we already have are not affected. */
+static void shed_one(struct listener *lis) {
+    if (lis->spare_fd < 0)
+        return;
+    close(lis->spare_fd);
+    int fd = accept4(lis->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd >= 0)
+        close(fd);
+    lis->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+}
+
+#define ACCEPT_BATCH 64 /* per wakeup, so one busy listener can't starve the loop */
+
 static void new_conn_incoming(struct loop *l, int, uint32_t, void *ud) {
     struct listener *lis = (struct listener *)(ud);
-    int peer_fd = accept4(lis->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (peer_fd < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
-            // Nothing ready, or the peer gave up before we accepted.
-            return;
-        }
-        err(EXIT_FAILURE, "can't accept any more");
-    }
 
-    struct conn *c = conn_alloc(l, peer_fd);
-    lis->handler(lis, c, lis->listener_ctx);
+    for (int i = 0; i < ACCEPT_BATCH; i++) {
+        int peer_fd = accept4(lis->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (peer_fd < 0) {
+            switch (errno) {
+            case EINTR:
+            case ECONNABORTED: // peer gave up before we accepted
+            case EPROTO:       // man accept(2): Linux reports pending network
+            case ENETDOWN:     // errors here, treat them like EAGAIN
+            case ENOPROTOOPT:
+            case EHOSTDOWN:
+            case ENONET:
+            case EHOSTUNREACH:
+            case EOPNOTSUPP:
+            case ENETUNREACH:
+                continue;
+            case EMFILE:
+            case ENFILE:
+                shed_one(lis);
+                return;
+            default: // EAGAIN: queue drained; ENOMEM/ENOBUFS: try again later
+                return;
+            }
+        }
+
+        struct conn *c = conn_alloc(l, peer_fd);
+        lis->handler(lis, c, lis->listener_ctx);
+    }
 }
 
 struct listener *listener_new(struct loop *l,
@@ -295,6 +338,7 @@ struct listener *listener_new(struct loop *l,
     struct listener *lis = MALLOC(sizeof(struct listener));
     *lis = (struct listener){
         .fd = fd,
+        .spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC),
         .handler = on_accept,
         .loop = l,
         .listener_ctx = ud,
@@ -302,8 +346,12 @@ struct listener *listener_new(struct loop *l,
 
     bool ok = loop_io_add(lis->loop, new_conn_incoming, lis->fd, EPOLLIN, lis);
     if (!ok) {
+        int e = errno;
         close(lis->fd);
+        if (lis->spare_fd >= 0)
+            close(lis->spare_fd);
         free(lis);
+        errno = e;
         return NULL;
     }
 
@@ -313,9 +361,12 @@ struct listener *listener_new(struct loop *l,
 void listener_close(struct listener *lis) {
     loop_io_remove(lis->loop, lis->fd);
     close(lis->fd);
+    if (lis->spare_fd >= 0)
+        close(lis->spare_fd);
     free(lis);
 }
 
+/* ---------- connection ---------- */
 
 void conn_start(struct conn *c, const struct conn_ops ops, void *ud) {
     if (c->closing || c->started)
@@ -352,6 +403,8 @@ struct conn *conn_connect(struct loop *l,
     if (fd < 0)
         return nullptr;
 
+    // EINPROGRESS is the normal answer. A result of 0 (instant success, can
+    // happen on loopback) takes the same path: epoll reports writable at once.
     if (connect(fd, (struct sockaddr *)&addr, addrlen) < 0 && errno != EINPROGRESS) {
         int err = errno;
         close(fd);

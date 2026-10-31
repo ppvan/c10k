@@ -13,7 +13,7 @@ test: debug
 debug:
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/loop_test.out src/loop_test.c src/loop.c
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/main.out src/main.c src/loop.c src/conn.c
-	$(CC) $(CFLAGS) -O0 $(SAN) -o build/client.out src/client.c
+	$(CC) $(CFLAGS) -O0 $(SAN) -o build/client.out src/client.c src/loop.c src/cli.c src/conn.c
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/echo.out src/echo.c src/loop.c src/cli.c src/conn.c
 
 tsan:
@@ -21,9 +21,9 @@ tsan:
 	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o build/main.out src/main.c src/loop.c
 
 release:
-	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o bin/client.out src/client.c
-	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o bin/server_poll_release.out src/server_poll.c
-	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o bin/server_thread_release.out src/server_thread.c
+	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/client.out src/client.c src/loop.c src/cli.c src/conn.c
+	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/echo_release.out src/echo.c src/loop.c src/cli.c src/conn.c
+	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/echo_poll.out src/server_poll.c
 
 
 clean:
