@@ -192,8 +192,9 @@ static void handle_connect(struct conn *c, uint32_t events) {
     socklen_t len = sizeof err;
     if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
         err = errno;
-    if (err == 0 && (events & (EPOLLERR | EPOLLHUP)))
+    if (err == 0 && (events & (EPOLLERR | EPOLLHUP))) {
         err = ECONNRESET; // failed, but the kernel has no specific error left
+    }
 
     if (err != 0) {
         conn_abort(c, err);
@@ -268,7 +269,7 @@ static void shed_one(struct listener *lis) {
     lis->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
 }
 
-#define ACCEPT_BATCH 64 /* per wakeup, so one busy listener can't starve the loop */
+#define ACCEPT_BATCH 4096 /* per wakeup, so one busy listener can't starve the loop */
 
 static void new_conn_incoming(struct loop *l, int, uint32_t, void *ud) {
     struct listener *lis = (struct listener *)(ud);

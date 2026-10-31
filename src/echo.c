@@ -5,9 +5,11 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+static uint32_t count = 0;
 
 struct echo {
     bool verbose;
@@ -66,9 +68,9 @@ static void on_accept(struct listener *ln, struct conn *c, void *ud) {
     };
 
     conn_start(c, ops, echo);
-
+    count++;
     if (echo->verbose) {
-        fprintf(stderr, "accepted\n");
+        fprintf(stderr, "%d accepted\n", count);
     }
 }
 
