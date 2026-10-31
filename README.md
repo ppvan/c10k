@@ -119,4 +119,14 @@ fds  100001 | iters/s       1 | ready/iter  99999.0 | poll  31.304 ms/iter | dis
 
 ### Epoll
 
-_TODO_
+Epoll can also handle 100k, as expected. However, the though put is smaller then poll (i.e slower). It counter intuive  compare to about the theory right?
+
+> You don't talk about performance until you profile/measure. The theory help you read the result and reasons about it, not guessing.
+
+| Implementation | Messages/s | Throughput  | p50 latency |
+| -------------- | ---------- | ----------- | ----------- |
+| `conn.h (epoll)` | 71,541     | 34.93 MiB/s | 1,048 ms    |
+| Raw `poll`     | 95,199     | 46.48 MiB/s | 720 ms      |
+
+It's may be cause by the conn abstraction layer I built on. To compare this fairly, I need to add `poll` backend to conn.h and I'm too lazy so let's ignore it and implement HTTP1.1 instead of simple echo.
+
