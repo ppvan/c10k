@@ -221,12 +221,6 @@ static void handle_connect(struct conn *c, uint32_t events) {
         c->ops.on_connect(c, c->conn_ctx);
 }
 
-static void connect_timeout_cb(struct loop *, void *ud) {
-    struct conn *c = ud;
-    c->connect_timer = 0; // this timer already fired, its id is dead
-    conn_abort(c, ETIMEDOUT);
-}
-
 static void io_signal_callback(struct loop *, int, uint32_t events, void *ud) {
     struct conn *c = (struct conn *)ud;
     if (c->closing)
@@ -389,8 +383,7 @@ void conn_start(struct conn *c, const struct conn_ops ops, void *ud) {
 struct conn *conn_connect(struct loop *l,
                           const char *ip,
                           uint16_t port,
-                          uint64_t timeout_ms,
-                          struct conn_ops ops,
+                          const struct conn_ops ops,
                           void *ud) {
     struct sockaddr_storage addr;
     socklen_t addrlen;
@@ -430,13 +423,10 @@ struct conn *conn_connect(struct loop *l,
     }
     c->started = true;
 
-    if (timeout_ms > 0)
-        c->connect_timer = loop_timer_add(l, timeout_ms, connect_timeout_cb, c);
-
     return c;
 }
 
-ssize_t conn_write(struct conn *c, const char *buf, size_t len) {
+int conn_write(struct conn *c, const void *buf, size_t len) {
     if (c->closing)
         return -EPIPE;
 
