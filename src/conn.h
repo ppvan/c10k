@@ -30,6 +30,11 @@ struct conn_ops {
      *      else an errno value (ECONNRESET, ETIMEDOUT for idle timeout,
      *      ECONNREFUSED, EMSGSIZE, ENOBUFS, ...). */
     void (*on_close)(struct conn *, int err, void *ud);
+
+    /* Optional. Peer finished sending; every byte it sent has already gone
+     * through on_read. NULL = default: conn_close() (flush replies, then close).
+     * If you set it you must eventually close the connection yourself. */
+    void (*on_eof)(struct conn *, void *ud);
 };
 
 /* Called once per accepted connection. You must call conn_start() on it
@@ -49,7 +54,13 @@ void listener_close(struct listener *);
  * set); later failures arrive via on_close. */
 struct conn *conn_connect(struct loop *l, const char *ip, uint16_t port, const struct conn_ops ops, void *ud);
 
+/* Immediate: drop queued output, close now. */
 void conn_abort(struct conn *, int err);
+/* Graceful: flush the write queue, then close. Reads stop immediately. */
+void conn_close(struct conn *c);
+/* Half-close: flush, then shutdown(SHUT_WR). Reading continues. */
+void conn_shutdown_write(struct conn *c);
+
 /* Accepted connections start paused. Attach handlers with this, then reading
  * begins. Call exactly once, from inside on_accept. */
 void conn_start(struct conn *c, const struct conn_ops ops, void *ud);
@@ -60,6 +71,7 @@ void conn_start(struct conn *c, const struct conn_ops ops, void *ud);
  *           and resume from on_drain
  *  -EPIPE   connection is closing; nothing queued */
 int conn_write(struct conn *c, const void *buf, size_t len);
+size_t conn_pending(const struct conn *c); /* bytes queued, unsent */
 
 /* Backpressure: app -> conn layer */
 void conn_read_pause(struct conn *);
@@ -67,6 +79,5 @@ void conn_read_resume(struct conn *);
 
 /* public property */ 
 struct loop *conn_loop(const struct conn *c);
-bool conn_peer(const struct conn *c, char *ip, size_t ip_len, uint16_t *port);
 
 #endif

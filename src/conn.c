@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #define BUF_SIZE 1048576
+#define DRAIN_TIMEOUT_MS 10000
 
 struct conn {
     struct loop *loop;
@@ -26,6 +27,15 @@ struct conn {
 
     char *read_buf;
     size_t r_queued;
+
+    /* connection state */
+    bool paused; /* app called conn_read_pause() */
+    bool rd_eof; /* peer sent FIN */
+    bool eof_notified;
+    bool draining;        /* conn_close(): flush queue, then close */
+    bool shut_wr_pending; /* conn_shutdown_write(): FIN once queue is empty */
+    bool wr_shut;         /* our FIN is sent */
+    uint64_t drain_timer; /* deadline for the flush */
 
     bool closing;
     int close_err;
@@ -59,10 +69,7 @@ static struct conn *conn_alloc(struct loop *l, int fd) {
 }
 
 /* Numeric IPv4 or IPv6 only. */
-static bool parse_addr(const char *ip,
-                       uint16_t port,
-                       struct sockaddr_storage *ss,
-                       socklen_t *len) {
+static bool parse_addr(const char *ip, uint16_t port, struct sockaddr_storage *ss, socklen_t *len) {
     struct sockaddr_in *sin = (struct sockaddr_in *)ss;
     struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
 
@@ -88,13 +95,26 @@ static bool sync_events(struct conn *c) {
     return loop_io_mod(c->loop, c->fd, c->events);
 }
 
+static void notify_eof(struct conn *c) {
+    c->eof_notified = true;
+    if (c->wr_shut) { /* we sent FIN, now they did: done */
+        conn_abort(c, 0);
+        return;
+    }
+    if (c->ops.on_eof != nullptr)
+        c->ops.on_eof(c, c->conn_ctx);
+    else
+        conn_close(c); /* default: flush replies, then close */
+}
+
 static void deliver(struct conn *c) {
-    if (c->closing || c->r_queued == 0 || !(c->events & EPOLLIN))
+    if (c->closing || c->r_queued == 0 || c->paused)
         return;
 
     size_t n = c->r_queued;
     size_t consumed = c->ops.on_read(c, c->read_buf, n, c->conn_ctx);
-    if (c->closing)
+    /* app.on_read() close connection or abort */
+    if (c->closing || c->draining)
         return;
 
     if (consumed > n) {
@@ -104,6 +124,9 @@ static void deliver(struct conn *c) {
 
     memmove(c->read_buf, c->read_buf + consumed, n - consumed);
     c->r_queued = n - consumed;
+
+    if (c->rd_eof && !c->eof_notified && !c->paused)
+        notify_eof(c);
 }
 
 static void deliver_cb(struct loop *, void *ud) {
@@ -113,12 +136,64 @@ static void deliver_cb(struct loop *, void *ud) {
 }
 
 static void schedule_deliver(struct conn *c) {
-    if (c->closing || c->deliver_id || c->r_queued == 0)
+    if (c->closing || c->draining || c->deliver_id)
+        return;
+    if (c->r_queued == 0 && !(c->rd_eof && !c->eof_notified))
         return;
     c->deliver_id = loop_timer_add(c->loop, 0, deliver_cb, c);
 }
 
+static void on_peer_eof(struct conn *c) {
+    c->rd_eof = true;
+    c->events &= ~EPOLLIN; /* else level-triggered epoll reports EOF forever */
+    if (!sync_events(c)) {
+        int e = errno;
+        conn_abort(c, e);
+        return;
+    }
+    schedule_deliver(c); /* hand over leftover bytes, then notify_eof */
+}
+
+#define DRAIN_TIMEOUT_MS 10000
+
+static int socket_error(struct conn *c) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err == 0)
+        return ECONNRESET;
+    return err;
+}
+
+static void flush_complete(struct conn *c) {
+    if (c->draining) { /* conn_close(): all out, finish */
+        conn_abort(c, c->close_err);
+        return;
+    }
+    if (c->shut_wr_pending) { /* conn_shutdown_write(): send FIN */
+        c->shut_wr_pending = false;
+        c->wr_shut = true;
+        if (shutdown(c->fd, SHUT_WR) < 0 && errno != ENOTCONN) {
+            int e = errno;
+            conn_abort(c, e);
+            return;
+        }
+        if (c->rd_eof) { /* both directions finished */
+            conn_abort(c, 0);
+            return;
+        }
+    } else if (c->ops.on_drain != nullptr) {
+        c->ops.on_drain(c, c->conn_ctx);
+        if (c->closing)
+            return;
+    }
+    sync_events(c);
+}
+
 static void handle_readable(struct conn *c) {
+
+    if (c->rd_eof || c->draining)
+        return;
+
     if (c->r_queued == BUF_SIZE) {
         deliver(c);
         if (c->closing)
@@ -127,7 +202,7 @@ static void handle_readable(struct conn *c) {
             // Buffer still full. If the app paused inside on_read this is
             // legitimate backpressure; otherwise it broke the contract.
             // Either way never recv() with length 0 (it looks like EOF).
-            if (c->events & EPOLLIN)
+            if (c->paused)
                 conn_abort(c, EMSGSIZE);
             return;
         }
@@ -135,7 +210,7 @@ static void handle_readable(struct conn *c) {
 
     ssize_t n = recv(c->fd, c->read_buf + c->r_queued, BUF_SIZE - c->r_queued, 0);
     if (n == 0) {
-        conn_abort(c, 0);
+        on_peer_eof(c);
         return;
     }
     if (n < 0) {
@@ -153,7 +228,7 @@ static void handle_readable(struct conn *c) {
 static void handle_writable(struct conn *c) {
     if (c->w_queued == 0) {
         c->events &= ~EPOLLOUT;
-        sync_events(c);
+        flush_complete(c);
         return;
     }
 
@@ -207,10 +282,7 @@ static void handle_connect(struct conn *c, uint32_t events) {
         c->connect_timer = 0;
     }
 
-    // Start reading. Keep EPOLLOUT only if conn_write() queued data before the
-    // handshake finished. Set this BEFORE on_connect so that a conn_read_pause
-    // or conn_write inside on_connect builds on the final state.
-    c->events = EPOLLIN | (c->w_queued > 0 ? EPOLLOUT : 0);
+    c->events = (c->paused ? 0 : EPOLLIN) | (c->w_queued > 0 ? EPOLLOUT : 0);
     if (!sync_events(c)) {
         int e = errno;
         conn_abort(c, e);
@@ -219,6 +291,56 @@ static void handle_connect(struct conn *c, uint32_t events) {
 
     if (c->ops.on_connect != nullptr)
         c->ops.on_connect(c, c->conn_ctx);
+
+    if (!c->closing && c->shut_wr_pending && c->w_queued == 0)
+        flush_complete(c);
+}
+
+static void drain_timeout_cb(struct loop *, void *ud) {
+    struct conn *c = ud;
+    c->drain_timer = 0; /* already fired, id is dead */
+    conn_abort(c, ETIMEDOUT);
+}
+
+void conn_close(struct conn *c) {
+    if (c->closing || c->draining)
+        return;
+
+    /* Nothing to flush, or not even registered or connected yet. */
+    if (c->w_queued == 0 || c->connecting || !c->started) {
+        conn_abort(c, 0);
+        return;
+    }
+
+    c->draining = true;
+    c->close_err = 0;
+
+    /* Reads stop now and unread input is discarded: the app said it is done. */
+    c->r_queued = 0;
+    if (c->deliver_id) {
+        loop_timer_cancel(c->loop, c->deliver_id);
+        c->deliver_id = 0;
+    }
+    c->events = EPOLLOUT;
+    if (!sync_events(c)) {
+        int e = errno;
+        conn_abort(c, e);
+        return;
+    }
+
+    /* Abort if final write never read by peer */
+    c->drain_timer = loop_timer_add(c->loop, DRAIN_TIMEOUT_MS, drain_timeout_cb, c);
+}
+
+void conn_shutdown_write(struct conn *c) {
+    if (c->closing || c->draining || c->shut_wr_pending || c->wr_shut)
+        return;
+
+    c->shut_wr_pending = true;
+    if (c->w_queued == 0 && !c->connecting) {
+        c->events &= ~EPOLLOUT;
+        flush_complete(c); /* nothing queued: FIN right now */
+    }
 }
 
 static void io_signal_callback(struct loop *, int, uint32_t events, void *ud) {
@@ -231,12 +353,12 @@ static void io_signal_callback(struct loop *, int, uint32_t events, void *ud) {
         return;
     }
 
-    if (events & (EPOLLERR | EPOLLHUP)) {
-        conn_abort(c, ECONNRESET);
+    if (events & EPOLLERR) {
+        conn_abort(c, socket_error(c));
         return;
     }
 
-    if (events & EPOLLIN) {
+    if (events & (EPOLLIN | EPOLLHUP)) {
         handle_readable(c);
         if (c->closing)
             return;
@@ -246,7 +368,6 @@ static void io_signal_callback(struct loop *, int, uint32_t events, void *ud) {
         handle_writable(c);
     }
 }
-
 
 /* Out of file descriptors. With level-triggered epoll the listener would fire
  * again immediately (100% CPU) and the waiting client would just hang in the
@@ -380,11 +501,7 @@ void conn_start(struct conn *c, const struct conn_ops ops, void *ud) {
     c->started = true;
 }
 
-struct conn *conn_connect(struct loop *l,
-                          const char *ip,
-                          uint16_t port,
-                          const struct conn_ops ops,
-                          void *ud) {
+struct conn *conn_connect(struct loop *l, const char *ip, uint16_t port, const struct conn_ops ops, void *ud) {
     struct sockaddr_storage addr;
     socklen_t addrlen;
 
@@ -427,7 +544,7 @@ struct conn *conn_connect(struct loop *l,
 }
 
 int conn_write(struct conn *c, const void *buf, size_t len) {
-    if (c->closing)
+    if (c->closing || c->draining || c->shut_wr_pending || c->wr_shut)
         return -EPIPE;
 
     if (len == 0)
@@ -477,9 +594,15 @@ void conn_abort(struct conn *c, int err) {
         loop_timer_cancel(c->loop, c->deliver_id);
         c->deliver_id = 0;
     }
+
     if (c->connect_timer) {
         loop_timer_cancel(c->loop, c->connect_timer);
         c->connect_timer = 0;
+    }
+
+    if (c->drain_timer) {
+        loop_timer_cancel(c->loop, c->drain_timer);
+        c->drain_timer = 0;
     }
 
     if (c->started)
@@ -491,20 +614,35 @@ void conn_abort(struct conn *c, int err) {
 }
 
 void conn_read_pause(struct conn *c) {
-    if (c->closing)
+    if (c->closing || c->draining)
         return;
-
+    c->paused = true;
     c->events &= ~EPOLLIN;
     sync_events(c);
 }
 
 void conn_read_resume(struct conn *c) {
-    if (c->closing)
+    if (c->closing || c->draining)
         return;
+    c->paused = false;
+    if (!c->rd_eof) { // never re-arm EPOLLIN after EOF
+        c->events |= EPOLLIN;
+        sync_events(c);
+    }
 
-    c->events |= EPOLLIN;
-    sync_events(c);
-
-    // The kernel can't see read_buf, so re-deliver it ourselves.
     schedule_deliver(c);
+}
+
+struct loop *conn_loop(const struct conn *c) {
+    if (c->closing)
+        return nullptr;
+
+    return c->loop;
+}
+
+size_t conn_pending(const struct conn *c) {
+    if (c->closing)
+        return 0;
+
+    return c->w_queued;
 }
