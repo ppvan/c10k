@@ -12,7 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BUF_SIZE 1048576
+#define BUF_SIZE 4096
 #define DRAIN_TIMEOUT_MS 10000
 
 struct conn {
@@ -140,7 +140,8 @@ static void schedule_deliver(struct conn *c) {
         return;
     if (c->r_queued == 0 && !(c->rd_eof && !c->eof_notified))
         return;
-    c->deliver_id = loop_timer_add(c->loop, 0, deliver_cb, c);
+    loop_task_add(c->loop, deliver_cb, c);
+    c->deliver_id = 1;
 }
 
 static void on_peer_eof(struct conn *c) {
@@ -591,7 +592,6 @@ void conn_abort(struct conn *c, int err) {
     c->close_err = err;
 
     if (c->deliver_id) {
-        loop_timer_cancel(c->loop, c->deliver_id);
         c->deliver_id = 0;
     }
 
@@ -610,7 +610,8 @@ void conn_abort(struct conn *c, int err) {
     close(c->fd);
     c->fd = -1;
 
-    c->reap_id = loop_timer_add(c->loop, 0, reap_cb, c);
+    loop_task_add(c->loop, reap_cb, c);
+    c->reap_id = 1;
 }
 
 void conn_read_pause(struct conn *c) {

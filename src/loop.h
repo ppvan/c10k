@@ -24,8 +24,12 @@ bool loop_io_add(struct loop *, io_cb, int, uint32_t, void *);
 bool loop_io_remove(struct loop *, int);
 bool loop_io_mod(struct loop *, int, uint32_t);
 
-void *must_alloc(void *p, const char *file, int line);
+/* Task queue */
+typedef void (*task_cb)(struct loop *, void *);
+void loop_task_add(struct loop *, task_cb, void *);
 
+/* I don't care about out of memory in this project */ 
+void *must_alloc(void *p, const char *file, int line);
 #define MALLOC(size) must_alloc(malloc(size), __FILE__, __LINE__)
 #define REALLOC(ptr, size)                                                     \
     must_alloc(realloc((ptr), (size)), __FILE__, __LINE__)

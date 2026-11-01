@@ -22,7 +22,7 @@ struct timer {
 
 #define NO_SLOT UINT32_MAX
 struct slot {
-    struct timer *t; // NULL when free
+    struct timer *t; // nullptr when free
     uint32_t gen;    // starts at 1, bumped on release
     uint32_t next_free;
 };
@@ -34,6 +34,15 @@ struct io_watch {
     io_cb handler;
     void *userdata;
 };
+
+struct task {
+    task_cb handler;
+    void *userdata;
+    struct task *next;
+};
+
+#define DEFAULT_ARRAY_CAP 256
+#define MAX_EVENTS 4096
 
 struct loop {
 
@@ -48,6 +57,10 @@ struct loop {
     struct io_watch **io_by_fd;
     size_t io_cap;
     size_t io_count;
+
+    // tasks
+    struct task *task_head;
+    struct task *task_tail;
 
     int epoll_fd;
     bool stopped;
@@ -81,8 +94,7 @@ static void timer_swap(struct timer **a, struct timer **b) {
 }
 
 static void heapify_up(struct loop *l, size_t index) {
-    while (index > 0 &&
-           timer_less(l->timers[index], l->timers[(index - 1) / 2])) {
+    while (index > 0 && timer_less(l->timers[index], l->timers[(index - 1) / 2])) {
         timer_swap(&l->timers[(index - 1) / 2], &l->timers[index]);
         index = (index - 1) / 2;
     }
@@ -95,13 +107,11 @@ static void heapify_down(struct loop *l, size_t index) {
         size_t left = 2 * index + 1;
         size_t right = 2 * index + 2;
 
-        if (left < l->timers_count &&
-            timer_less(l->timers[left], l->timers[smallest])) {
+        if (left < l->timers_count && timer_less(l->timers[left], l->timers[smallest])) {
             smallest = left;
         }
 
-        if (right < l->timers_count &&
-            timer_less(l->timers[right], l->timers[smallest])) {
+        if (right < l->timers_count && timer_less(l->timers[right], l->timers[smallest])) {
             smallest = right;
         }
 
@@ -130,9 +140,7 @@ static void slots_grow(struct loop *l) {
     uint32_t cap = old * 2;
     struct slot *s = REALLOC(l->slots, cap * sizeof(struct slot));
     for (uint32_t i = old; i < cap; i++) {
-        s[i] = (struct slot){.t = NULL,
-                             .gen = 1,
-                             .next_free = (i + 1 < cap) ? i + 1 : l->free_head};
+        s[i] = (struct slot){.t = nullptr, .gen = 1, .next_free = (i + 1 < cap) ? i + 1 : l->free_head};
     }
 
     l->slots = s;
@@ -159,7 +167,7 @@ static void slot_release(struct loop *l, struct timer *t) {
     uint32_t i = t->slot_idx;
     struct slot *s = l->slots;
 
-    s[i].t = NULL;
+    s[i].t = nullptr;
     // wrap around when overflow
     if (++s[i].gen == 0) {
         s[i].gen = 1;
@@ -172,7 +180,7 @@ static struct timer *timer_lookup(struct loop *l, uint64_t id) {
     uint32_t slot = (uint32_t)id, gen = (uint32_t)(id >> 32);
 
     if (slot >= l->slots_cap || l->slots[slot].gen != gen) {
-        return NULL;
+        return nullptr;
     }
 
     return l->slots[slot].t;
@@ -180,14 +188,14 @@ static struct timer *timer_lookup(struct loop *l, uint64_t id) {
 
 static struct timer *timers_heap_peek(const struct loop *l) {
     if (l->timers_count == 0) {
-        return NULL;
+        return nullptr;
     }
     return l->timers[0];
 }
 
 static struct timer *timers_heap_pop(struct loop *l) {
     if (l->timers_count == 0) {
-        return NULL;
+        return nullptr;
     }
 
     struct timer *root = l->timers[0];
@@ -202,30 +210,47 @@ static struct timer *timers_heap_pop(struct loop *l) {
     return root;
 }
 
+static void loop_run_tasks(struct loop *l) {
+    while (l->task_head != nullptr) {
+        struct task *t = l->task_head;
+
+        l->task_head = t->next;
+
+        if (l->task_head == nullptr) {
+            l->task_tail = nullptr;
+        }
+        /* Order matters, remove any task ref before execute the task, since the callback can change the task queue. */
+        task_cb cb = t->handler;
+        void *ud = t->userdata;
+        free(t);
+        cb(l, ud);
+    }
+}
+
 struct loop *loop_new(void) {
     struct loop *l = MALLOC(sizeof(struct loop));
 
-    l->timers_cap = 256;
+    l->timers_cap = DEFAULT_ARRAY_CAP;
     l->timers_count = 0;
     l->timers = MALLOC(l->timers_cap * sizeof(struct timer *));
 
-    l->slots_cap = 256;
+    l->slots_cap = DEFAULT_ARRAY_CAP;
     l->slots = MALLOC(l->slots_cap * sizeof(struct slot));
 
     for (uint32_t i = 0; i < l->slots_cap; i++) {
-        l->slots[i] = (struct slot){
-            .t = NULL,
-            .gen = 1,
-            .next_free = (i + 1 < l->slots_cap) ? i + 1 : NO_SLOT};
+        l->slots[i] = (struct slot){.t = nullptr, .gen = 1, .next_free = (i + 1 < l->slots_cap) ? i + 1 : NO_SLOT};
     }
     l->free_head = 0;
 
-    l->io_cap = 256;
+    l->io_cap = DEFAULT_ARRAY_CAP;
     l->io_count = 0;
     l->io_by_fd = MALLOC(l->io_cap * sizeof(struct io_watch));
     for (uint32_t i = 0; i < l->io_cap; i++) {
-        l->io_by_fd[i] = NULL;
+        l->io_by_fd[i] = nullptr;
     }
+
+    l->task_head = nullptr;
+    l->task_tail = nullptr;
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
@@ -237,7 +262,7 @@ struct loop *loop_new(void) {
     return l;
 }
 void loop_destroy(struct loop *l) {
-    if (l == NULL)
+    if (l == nullptr)
         return;
 
     for (size_t i = 0; i < l->timers_count; i++)
@@ -252,11 +277,25 @@ void loop_destroy(struct loop *l) {
     free(l->timers);
     free(l);
 }
-uint64_t loop_timer_add(struct loop *l, uint64_t delay_ms, timer_cb cb,
-                        void *userdata) {
-    struct timer *t = MALLOC(sizeof(struct timer));
 
-    if(delay_ms == 0) delay_ms = 1;
+void loop_task_add(struct loop *l, task_cb h, void *task_ctx) {
+
+    struct task *t = MALLOC(sizeof(struct task));
+    t->handler = h;
+    t->userdata = task_ctx;
+    t->next = nullptr;
+
+    if (l->task_tail == nullptr) {
+        l->task_head = t;
+    } else {
+        l->task_tail->next = t;
+    }
+
+    l->task_tail = t;
+}
+
+uint64_t loop_timer_add(struct loop *l, uint64_t delay_ms, timer_cb cb, void *userdata) {
+    struct timer *t = MALLOC(sizeof(struct timer));
 
     uint64_t now = monotonic_ms();
     t->expiration_ms = delay_ms + now;
@@ -270,7 +309,7 @@ uint64_t loop_timer_add(struct loop *l, uint64_t delay_ms, timer_cb cb,
 
 bool loop_timer_cancel(struct loop *l, uint64_t id) {
     struct timer *t = timer_lookup(l, id);
-    if (t == NULL) {
+    if (t == nullptr) {
         return false;
     }
 
@@ -292,15 +331,17 @@ bool loop_timer_cancel(struct loop *l, uint64_t id) {
     return true;
 }
 void loop_run(struct loop *l) {
-    struct epoll_event events[1024];
+    struct epoll_event events[MAX_EVENTS];
     const int max_events = (int)(sizeof events / sizeof events[0]);
-
     l->stopped = false;
 
-    while (!l->stopped && (l->timers_count > 0 || l->io_count > 0)) {
+    while ((!l->stopped && (l->timers_count > 0 || l->io_count > 0 || l->task_head != nullptr))) {
+        // Task has the 1st priority
+        loop_run_tasks(l);
+
         int timeout = -1;
         struct timer *t = timers_heap_peek(l);
-        if (t != NULL) {
+        if (t != nullptr) {
             uint64_t now = monotonic_ms();
             if (t->expiration_ms <= now) {
                 timeout = 0;
@@ -326,7 +367,7 @@ void loop_run(struct loop *l) {
             if ((size_t)fd >= l->io_cap)
                 continue;
             struct io_watch *w = l->io_by_fd[fd];
-            if (w == NULL || w->gen != gen)
+            if (w == nullptr || w->gen != gen)
                 continue; /* removed or fd reused */
 
             w->handler(l, fd, events[i].events, w->userdata);
@@ -334,8 +375,7 @@ void loop_run(struct loop *l) {
 
         /* 4. Run expired timers (fresh clock, one snapshot per pass) */
         uint64_t now = monotonic_ms();
-        while (!l->stopped && (t = timers_heap_peek(l)) != NULL &&
-               t->expiration_ms <= now) {
+        while (!l->stopped && (t = timers_heap_peek(l)) != nullptr && t->expiration_ms <= now) {
             t = timers_heap_pop(l);
             slot_release(l, t);
 
@@ -348,10 +388,7 @@ void loop_run(struct loop *l) {
     }
 }
 
-
-static uint64_t io_token(uint32_t gen, int fd) {
-    return ((uint64_t)gen << 32) | (uint32_t)fd;
-}
+static uint64_t io_token(uint32_t gen, int fd) { return ((uint64_t)gen << 32) | (uint32_t)fd; }
 
 static void io_ensure_cap(struct loop *l, int fd) {
     size_t need = (size_t)fd + 1;
@@ -364,12 +401,11 @@ static void io_ensure_cap(struct loop *l, int fd) {
 
     l->io_by_fd = REALLOC(l->io_by_fd, cap * sizeof *l->io_by_fd);
     for (size_t i = l->io_cap; i < cap; i++)
-        l->io_by_fd[i] = NULL;
+        l->io_by_fd[i] = nullptr;
     l->io_cap = cap;
 }
 
-bool loop_io_add(struct loop *l, io_cb callback, int fd, uint32_t events,
-                 void *userdata) {
+bool loop_io_add(struct loop *l, io_cb callback, int fd, uint32_t events, void *userdata) {
     if (fd < 0) {
         errno = EBADF;
         return false;
@@ -377,12 +413,12 @@ bool loop_io_add(struct loop *l, io_cb callback, int fd, uint32_t events,
     io_ensure_cap(l, fd);
 
     uint32_t gen = ++l->io_gen;
-    if (gen == 0)                       // 0 is never a valid generation
+    if (gen == 0) // 0 is never a valid generation
         gen = ++l->io_gen;
 
     struct epoll_event ev = {.events = events, .data.u64 = io_token(gen, fd)};
     if (epoll_ctl(l->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
-        return false;                   // errno left for the caller (EEXIST, EBADF, ...)
+        return false; // errno left for the caller (EEXIST, EBADF, ...)
 
     struct io_watch *w = MALLOC(sizeof *w);
     *w = (struct io_watch){
@@ -397,7 +433,7 @@ bool loop_io_add(struct loop *l, io_cb callback, int fd, uint32_t events,
     // reused, the kernel already dropped the old registration. Replace, don't leak.
     struct io_watch *old = l->io_by_fd[fd];
     l->io_by_fd[fd] = w;
-    if (old != NULL)
+    if (old != nullptr)
         free(old);
     else
         l->io_count++;
@@ -406,17 +442,16 @@ bool loop_io_add(struct loop *l, io_cb callback, int fd, uint32_t events,
 }
 
 bool loop_io_remove(struct loop *l, int fd) {
-    if (fd < 0 || (size_t)fd >= l->io_cap || l->io_by_fd[fd] == NULL)
+    if (fd < 0 || (size_t)fd >= l->io_cap || l->io_by_fd[fd] == nullptr)
         return false;
 
     // EBADF/ENOENT means the fd was already closed and the kernel dropped it.
     // That's fine: we still need to free our side.
-    if (epoll_ctl(l->epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0 &&
-        errno != EBADF && errno != ENOENT)
+    if (epoll_ctl(l->epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 && errno != EBADF && errno != ENOENT)
         return false;
 
     free(l->io_by_fd[fd]);
-    l->io_by_fd[fd] = NULL;
+    l->io_by_fd[fd] = nullptr;
     l->io_count--;
     return true;
 }
@@ -426,7 +461,7 @@ bool loop_io_mod(struct loop *l, int fd, uint32_t events) {
         return false;
 
     struct io_watch *w = l->io_by_fd[fd];
-    if (w == NULL)
+    if (w == nullptr)
         return false;
 
     // MOD replaces the stored data too, so it must carry the same gen.
@@ -440,7 +475,7 @@ bool loop_io_mod(struct loop *l, int fd, uint32_t events) {
 void loop_stop(struct loop *l) { l->stopped = true; }
 
 void *must_alloc(void *p, const char *file, int line) {
-    if (p == NULL) {
+    if (p == nullptr) {
         errx(EXIT_FAILURE, "%s:%d: out of memory", file, line);
     }
     return p;
