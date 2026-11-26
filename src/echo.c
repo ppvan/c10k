@@ -4,26 +4,18 @@
 #include "loop.h"
 
 #include <errno.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 static uint32_t count = 0;
 
-struct echo {
+struct http_server {
     bool verbose;
 };
 
-static struct loop *g_loop;
 
-
-static size_t client_on_read(
-    struct conn *c,
-    const void *buf,
-    size_t len,
-    void *ud
-) {
+static size_t client_on_read(struct conn *c, const void *buf, size_t len, void *ud) {
     (void)ud;
 
     // Pause before writing in case on_drain fires synchronously.
@@ -44,22 +36,17 @@ static void client_on_drain(struct conn *c, void *ud) {
 static void client_on_close(struct conn *c, int err, void *ud) {
     (void)c;
 
-    struct echo *echo = ud;
+    struct http_server *echo = ud;
 
     if (echo->verbose) {
-        fprintf(
-            stderr,
-            "closed: %s\n",
-            err ? strerror(err) : "peer closed"
-        );
+        fprintf(stderr, "closed: %s\n", err ? strerror(err) : "peer closed");
     }
 }
-
 
 static void on_accept(struct listener *ln, struct conn *c, void *ud) {
     (void)ln;
 
-    struct echo *echo = ud;
+    struct http_server *echo = ud;
 
     static const struct conn_ops ops = {
         .on_read = client_on_read,
@@ -74,57 +61,25 @@ static void on_accept(struct listener *ln, struct conn *c, void *ud) {
     }
 }
 
-
-static void on_signal(int sig) {
-    (void)sig;
-
-    if (g_loop) {
-        loop_stop(g_loop);
-    }
-}
-
 int main(int argc, char **argv) {
     struct cli_config cfg;
     cli_parse(&cfg, argc, argv, NULL);
 
-    struct loop *l = loop_new();
-    g_loop = l;
-
-    struct echo echo = {
+    struct http_server echo = {
         .verbose = cfg.verbose,
     };
 
-    struct listener *ln = listener_new(
-        l,
-        cfg.address,
-        cfg.port,
-        cfg.backlog,
-        on_accept,
-        &echo
-    );
+    struct loop *l = loop_new();
+    struct listener *ln = listener_new(l, cfg.address, cfg.port, cfg.backlog, on_accept, &echo);
 
     if (ln == NULL) {
         err(EXIT_FAILURE, "listen %s:%u", cfg.address, cfg.port);
     }
 
-    printf(
-        "Listening on %s:%u (backlog %d)\n",
-        cfg.address,
-        cfg.port,
-        cfg.backlog
-    );
-
-    struct sigaction sa = {
-        .sa_handler = on_signal,
-    };
-
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    printf("Listening on %s:%u (backlog %d)\n", cfg.address, cfg.port, cfg.backlog);
 
     loop_run(l);
 
-    g_loop = NULL;
     listener_close(ln);
     loop_destroy(l);
 
