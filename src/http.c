@@ -9,24 +9,63 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+
+#define DELIM_LEN 4
+#define MAX_HEADER_SIZE 8192
+const char *HTTP_HEADER_END = "\r\n\r\n";
 
 struct http_server {
     bool verbose;
 };
 
+ssize_t header_end_index(const char *buf, size_t n) {
+    // If buf is smaller than "\r\n\r\n", abort search.
+    if (n < 4) {
+        return -1;
+    }
+
+    for (size_t i = 0; i <= n - 4; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            return (ssize_t)i;
+        }
+    }
+
+    return -1;
+}
 
 static size_t client_on_read(struct conn *c, const void *buf, size_t len, void *ud) {
     (void)ud;
 
-    // Pause before writing in case on_drain fires synchronously.
-    conn_read_pause(c);
+    ssize_t header_end = header_end_index(buf, len);
+    if (header_end == -1) {
+        return 0;
+    }
 
-    const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello";
+    // Pause before writing in case on_drain fires synchronously.
+    if (header_end >= MAX_HEADER_SIZE) {
+        const char *resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 31\r\nContent-Type: "
+                           "text/plain\r\nConnection: close\r\n\r\nRequest Header Fields Too Large";
+        const size_t resp_len = strlen(resp);
+
+        conn_read_pause(c);
+        if (conn_write(c, resp, resp_len) < 0) {
+            conn_abort(c, errno ? errno : EIO);
+        }
+        conn_close(c);
+
+        return len;
+    }
+
+    const char *resp =
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello";
     const size_t resp_len = strlen(resp);
 
+    conn_read_pause(c);
     if (conn_write(c, resp, resp_len) < 0) {
         conn_abort(c, errno ? errno : EIO);
     }
+    conn_close(c);
 
     return len;
 }

@@ -12,7 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BUF_SIZE 4096
+#define BUF_SIZE 16384
 #define DRAIN_TIMEOUT_MS 10000
 
 struct conn {
@@ -249,11 +249,19 @@ static void handle_writable(struct conn *c) {
 
     if (c->w_queued == 0) {
         c->events &= ~EPOLLOUT;
+
+        if (c->draining || c->shut_wr_pending) {
+            flush_complete(c);
+            return;
+        }
+
         if (c->ops.on_drain != nullptr) {
             c->ops.on_drain(c, c->conn_ctx);
         }
+
         if (c->closing)
             return;
+
         sync_events(c);
     }
 }
