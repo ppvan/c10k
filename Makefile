@@ -12,13 +12,13 @@ test: debug
 
 debug:
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/loop_test.out src/loop_test.c src/loop.c
-	$(CC) $(CFLAGS) -O0 $(SAN) -o build/http.out src/http.c src/loop.c src/conn.c src/cli.c
+	$(CC) $(CFLAGS) -O0 $(SAN) -o build/http.out src/http_server.c src/http.c src/loop.c src/conn.c src/cli.c
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/client.out src/client.c src/loop.c src/cli.c src/conn.c
 	$(CC) $(CFLAGS) -O0 $(SAN) -o build/echo.out src/echo.c src/loop.c src/cli.c src/conn.c
 
 tsan:
 	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o build/loop_test.out src/loop_test.c src/loop.c
-	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o build/http.out src/http.c src/loop.c src/cli.c
+	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o build/http.out src/http_server.c src/http.c src/loop.c src/cli.c
 
 release:
 	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/client.out src/client.c src/loop.c src/cli.c src/conn.c

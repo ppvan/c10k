@@ -3,6 +3,7 @@
 #include "conn.h"
 #include "loop.h"
 
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,14 +25,22 @@ static size_t client_on_read(struct conn *c, const void *buf, size_t len, void *
     switch (http_parse(buf, len, &r)) {
     case HTTP_INCOMPLETE: {
         if (len >= MAX_HEADER_SIZE) {
-            const char *resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 31\r\nContent-Type: "
-                               "text/plain\r\nConnection: close\r\n\r\nRequest Header Fields Too Large";
-            const size_t resp_len = strlen(resp);
-
-            conn_read_pause(c);
-            if (conn_write(c, resp, resp_len) < 0) {
-                conn_abort(c, errno ? errno : EIO);
+            struct http_response *res = http_response_new();
+            if (res == nullptr) {
+                conn_abort(c, errno);
+                return len;
             }
+
+            http_response_status(res, HTTP_431_HEADER_FIELDS_TOO_LARGE);
+            http_response_header(res, "Content-Type", "text/plain");
+            http_response_header(res, "Connection", "close");
+            http_response_body(res, "Request Header Fields Too Large", 31);
+
+            const char *out;
+            size_t out_len;
+            if (http_response_build(res, &out, &out_len) == 0)
+                conn_write(c, out, out_len);
+            http_response_free(res);
             conn_close(c);
 
             return len;
@@ -39,27 +48,33 @@ static size_t client_on_read(struct conn *c, const void *buf, size_t len, void *
         return 0;
     }
     case HTTP_BAD: {
-        const char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nContent-Type: "
-                           "text/plain\r\nConnection: close\r\n\r\nBad Request";
-        const size_t resp_len = strlen(resp);
+        struct http_response *res = http_response_new();
+        http_response_status(res, HTTP_400_BAD_REQUEST);
+        http_response_header(res, "Content-Type", "text/plain");
+        http_response_header(res, "Connection", "close");
+        http_response_body(res, "Bad Request", 5);
 
-        conn_read_pause(c);
-        if (conn_write(c, resp, resp_len) < 0) {
-            conn_abort(c, errno ? errno : EIO);
-        }
+        const char *out;
+        size_t out_len;
+        if (http_response_build(res, &out, &out_len) == 0)
+            conn_write(c, out, out_len);
+        http_response_free(res);
         conn_close(c);
 
         return len;
     }
     case HTTP_OK: {
-        const char *resp =
-            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello";
-        const size_t resp_len = strlen(resp);
+        struct http_response *res = http_response_new();
+        http_response_status(res, HTTP_200_OK);
+        http_response_header(res, "Content-Type", "text/plain");
+        http_response_header(res, "Connection", "close");
+        http_response_body(res, "OK", 2);
 
-        conn_read_pause(c);
-        if (conn_write(c, resp, resp_len) < 0) {
-            conn_abort(c, errno ? errno : EIO);
-        }
+        const char *out;
+        size_t out_len;
+        if (http_response_build(res, &out, &out_len) == 0)
+            conn_write(c, out, out_len);
+        http_response_free(res);
         conn_close(c);
 
         return len;
