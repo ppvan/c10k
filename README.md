@@ -128,3 +128,25 @@ Epoll can also handle 100k, as expected. However, the throughput is lower than `
 | Raw `poll` | 95,199 | 46.48 MiB/s | 720 ms |
 
 It may be caused by the `conn` abstraction layer I built on top of it. To compare this fairly, I need to add a `poll` backend to `conn.h`. But I'm too lazy, so let's ignore that and implement HTTP/1.1 instead of a simple echo server.
+
+
+### HTTP 1.1 server
+
+Added a simple http parser on top with keep alive to use `wrk` tools. Since http requests can re-use TCP connection, 10k http request is easy target.
+
+```
+ wrk -t4 -c10000 -d30s --latency http://127.0.0.1:8080/
+Running 30s test @ http://127.0.0.1:8080/
+  4 threads and 10000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   310.94ms   17.20ms 417.55ms   72.08%
+    Req/Sec     8.69k     6.06k   24.56k    63.70%
+  Latency Distribution
+     50%  310.00ms
+     75%  320.80ms
+     90%  330.53ms
+     99%  379.14ms
+  950000 requests in 30.03s, 293.56MB read
+Requests/sec:  31633.60
+Transfer/sec:      9.78M
+```

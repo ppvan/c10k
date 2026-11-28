@@ -24,6 +24,7 @@ release:
 	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/client.out src/client.c src/loop.c src/cli.c src/conn.c
 	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/echo_release.out src/echo.c src/loop.c src/cli.c src/conn.c
 	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/echo_poll.out src/server_poll.c
+	$(CC) $(CFLAGS) -O2 -D_FORTIFY_SOURCE=2 -o build/http_server.out src/http_server.c src/http.c src/loop.c src/conn.c src/cli.c
 
 
 clean:

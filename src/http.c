@@ -4,8 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-
-#define MAX_HEADER_SIZE 8192
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 static const char *find_byte(const char *p, const char *end, char c) {
@@ -109,7 +107,6 @@ enum http_status http_parse(const char *buf, size_t len, struct http_request *r)
     return HTTP_OK;
 }
 
-
 /* Layout of res->buffer:
  *
  *   [ strings ... ->            free            <- head | body ]
@@ -170,9 +167,10 @@ void http_response_free(struct http_response *res) { free(res); }
 
 const char *http_code_reason(enum http_code code) {
     switch (code) {
-#define X(num, name, reason) \
-    case HTTP_##num##_##name: return reason;
-    HTTP_STATUS_LIST(X)
+#define X(num, name, reason)                                                                                           \
+    case HTTP_##num##_##name:                                                                                          \
+        return reason;
+        HTTP_STATUS_LIST(X)
 #undef X
     }
     return nullptr;
@@ -280,4 +278,112 @@ int http_response_build(struct http_response *res, const char **out, size_t *out
     *out = start;
     *out_len = head_len + res->body_len;
     return 0;
+}
+
+bool http_name_is(struct slice s, const char *lit) {
+    size_t n = strlen(lit);
+    return s.n == n && strncasecmp(s.p, lit, n) == 0;
+}
+
+bool http_has_token(struct slice v, const char *tok) {
+    size_t tl = strlen(tok);
+    const char *p = v.p, *end = v.p + v.n;
+
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ','))
+            p++;
+        const char *q = p;
+        while (q < end && *q != ',' && *q != ' ' && *q != '\t')
+            q++;
+        if ((size_t)(q - p) == tl && strncasecmp(p, tok, tl) == 0)
+            return true;
+        p = q;
+    }
+    return false;
+}
+
+bool http_wants_keep_alive(const struct http_request *r) {
+    bool keep = r->minor >= 1;
+
+    for (size_t i = 0; i < r->nheaders; i++) {
+        const struct http_header *h = &r->headers[i];
+
+        /* Request bodies are never read, so leftover body bytes would be
+         * parsed as the next request. Close instead. */
+        if (http_name_is(h->name, "Transfer-Encoding"))
+            return false;
+        if (http_name_is(h->name, "Content-Length") && !(h->value.n == 1 && h->value.p[0] == '0'))
+            return false;
+
+        if (http_name_is(h->name, "Connection")) {
+            if (http_has_token(h->value, "close"))
+                return false;
+            if (http_has_token(h->value, "keep-alive"))
+                keep = true;
+        }
+    }
+    return keep;
+}
+
+struct slice http_target_normalize(struct slice t) {
+    const char *q = memchr(t.p, '?', t.n);
+    if (q != NULL)
+        t.n = (size_t)(q - t.p);
+
+    if (t.n == 1 && t.p[0] == '/')
+        return (struct slice){"/index.html", 11};
+    return t;
+}
+
+bool http_target_is_safe(struct slice t) {
+    if (t.n == 0 || t.p[0] != '/' || memchr(t.p, '\0', t.n) != NULL)
+        return false;
+
+    for (size_t i = 0; i < t.n;) {
+        size_t j = i + 1; /* skip the '/' */
+        while (j < t.n && t.p[j] != '/')
+            j++;
+        if (j - (i + 1) == 2 && t.p[i + 1] == '.' && t.p[i + 2] == '.')
+            return false;
+        i = j;
+    }
+    return true;
+}
+
+static const struct {
+    const char *ext, *type;
+} mime_types[] = {
+    {".html", "text/html; charset=utf-8"},
+    {".css", "text/css; charset=utf-8"},
+    {".js", "text/javascript; charset=utf-8"},
+    {".json", "application/json"},
+    {".txt", "text/plain; charset=utf-8"},
+    {".svg", "image/svg+xml"},
+    {".png", "image/png"},
+    {".jpg", "image/jpeg"},
+    {".jpeg", "image/jpeg"},
+    {".gif", "image/gif"},
+    {".ico", "image/x-icon"},
+    {".wasm", "application/wasm"},
+    {".pdf", "application/pdf"},
+};
+
+const char *http_mime_for(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (dot != NULL) {
+        for (size_t i = 0; i < ARRAY_LEN(mime_types); i++)
+            if (strcasecmp(dot, mime_types[i].ext) == 0)
+                return mime_types[i].type;
+    }
+    return "application/octet-stream";
+}
+
+int http_file_head(char *buf, size_t cap, const char *content_type, off_t size, bool keep) {
+    int n = snprintf(buf, cap,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %lld\r\n"
+                     "Connection: %s\r\n\r\n",
+                     content_type, (long long)size, keep ? "keep-alive" : "close");
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }

@@ -12,7 +12,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BUF_SIZE 1048576
+
+#define READ_BUF_SIZE 16 * 1024
+#define WRITE_BUF_SIZE 64 * 1024
 #define DRAIN_TIMEOUT_MS 10000
 
 struct conn {
@@ -63,8 +65,8 @@ static struct conn *conn_alloc(struct loop *l, int fd) {
     *c = (struct conn){};
     c->fd = fd;
     c->loop = l;
-    c->read_buf = MALLOC(BUF_SIZE * sizeof(char));
-    c->write_buf = MALLOC(BUF_SIZE * sizeof(char));
+    c->read_buf = MALLOC(READ_BUF_SIZE * sizeof(char));
+    c->write_buf = MALLOC(WRITE_BUF_SIZE * sizeof(char));
     return c;
 }
 
@@ -195,11 +197,11 @@ static void handle_readable(struct conn *c) {
     if (c->rd_eof || c->draining)
         return;
 
-    if (c->r_queued == BUF_SIZE) {
+    if (c->r_queued == READ_BUF_SIZE) {
         deliver(c);
         if (c->closing)
             return;
-        if (c->r_queued == BUF_SIZE) {
+        if (c->r_queued == READ_BUF_SIZE) {
             // Buffer still full. If the app paused inside on_read this is
             // legitimate backpressure; otherwise it broke the contract.
             // Either way never recv() with length 0 (it looks like EOF).
@@ -209,7 +211,7 @@ static void handle_readable(struct conn *c) {
         }
     }
 
-    ssize_t n = recv(c->fd, c->read_buf + c->r_queued, BUF_SIZE - c->r_queued, 0);
+    ssize_t n = recv(c->fd, c->read_buf + c->r_queued, READ_BUF_SIZE - c->r_queued, 0);
     if (n == 0) {
         on_peer_eof(c);
         return;
@@ -559,10 +561,10 @@ int conn_write(struct conn *c, const void *buf, size_t len) {
     if (len == 0)
         return 0;
 
-    if (len > BUF_SIZE)
+    if (len > WRITE_BUF_SIZE)
         return -EMSGSIZE; // can never fit, retrying on on_drain would hang
 
-    if (c->w_queued + len > BUF_SIZE)
+    if (c->w_queued + len > WRITE_BUF_SIZE)
         return -ENOBUFS;
 
     size_t old_queued = c->w_queued;

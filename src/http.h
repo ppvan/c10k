@@ -5,8 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_HEADER_SIZE 8192
-#define BUF_SIZE 1048576
+#define MAX_HEADER_SIZE 8 * 1024
+#define HTTP_RESP_BUF_SIZE 16 * 1024
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 enum http_status { HTTP_OK, HTTP_INCOMPLETE, HTTP_BAD };
@@ -60,7 +60,7 @@ struct http_response {
     char *body;
     size_t body_len;
     
-    char buffer[BUF_SIZE];
+    char buffer[HTTP_RESP_BUF_SIZE];
     size_t buffer_len;
 };
 const char *http_code_reason(enum http_code code);
@@ -70,5 +70,16 @@ int http_response_status(struct http_response *res, enum http_code code);
 int http_response_header(struct http_response *res, const char *name, const char *value);
 int http_response_body(struct http_response *res, const void *data, size_t len);
 int http_response_build(struct http_response *res, const char **out, size_t *out_len);
+
+
+
+bool http_name_is(struct slice s, const char *lit);            /* case-insensitive */
+bool http_has_token(struct slice value, const char *tok);      /* "keep-alive, close" style lists */
+bool http_wants_keep_alive(const struct http_request *r);
+struct slice http_target_normalize(struct slice target);       /* strips ?query, "/" -> "/index.html" */
+bool http_target_is_safe(struct slice target);                 /* no "..", NUL, or relative form */
+const char *http_mime_for(const char *path);
+
+int http_file_head(char *buf, size_t cap, const char *content_type, off_t size, bool keep);
 
 #endif
