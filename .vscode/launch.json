@@ -6,7 +6,7 @@
       "request": "launch",
       "name": "Debug server",
       "program": "${workspaceFolder}/build/http.out",
-      "args": ["127.0.0.1", "8080"],
+      "args": ["127.0.0.1", "8080", "-r", "docs"],
       "cwd": "${workspaceFolder}",
       "env": {
         "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1"

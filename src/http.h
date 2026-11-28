@@ -2,8 +2,11 @@
 #define HTTP_H
 
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 #define MAX_HEADER_SIZE 8192
+#define BUF_SIZE 1048576
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 enum http_status { HTTP_OK, HTTP_INCOMPLETE, HTTP_BAD };
@@ -47,38 +50,20 @@ enum http_code {
     HTTP_STATUS_LIST(X)
 #undef X
 };
-const char *http_code_reason(enum http_code code);
 struct http_response {
     enum http_code status_code; /* 0 = not set yet */
     const char *reason;         /* points to static storage */
-
+    
     struct http_header headers[32];
     size_t nheaders;
-
+    
     char *body;
     size_t body_len;
-
-    char buffer[512 * 1024];
+    
+    char buffer[BUF_SIZE];
     size_t buffer_len;
 };
-
 const char *http_code_reason(enum http_code code);
-
-struct http_response {
-    enum http_code status_code; /* 0 = not set yet */
-    const char *reason;
-
-    struct http_header headers[32];
-    size_t nheaders;
-
-    char *body;
-    size_t body_len;
-
-    char buffer[512 * 1024];
-    size_t buffer_len;
-};
-
-
 struct http_response *http_response_new(void);
 void http_response_free(struct http_response *res);
 int http_response_status(struct http_response *res, enum http_code code);

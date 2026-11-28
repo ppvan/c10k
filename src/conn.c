@@ -12,7 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BUF_SIZE 16384
+#define BUF_SIZE 1048576
 #define DRAIN_TIMEOUT_MS 10000
 
 struct conn {
